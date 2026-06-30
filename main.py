@@ -2,14 +2,184 @@ import ctypes
 import inspect
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
 from ollama import chat
+
+
+SAVED_PAGES_PATH = Path(__file__).with_name("saved_pages.md")
+
+CURRENT_PAGE_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class BrowserWindowFinder
+{
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(
+        IntPtr hWnd,
+        StringBuilder className,
+        int maxCount
+    );
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(
+        IntPtr hWnd,
+        out uint processId
+    );
+
+    public static IntPtr[] GetWindows()
+    {
+        var windows = new List<IntPtr>();
+
+        EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
+        {
+            if (!IsWindowVisible(hWnd))
+            {
+                return true;
+            }
+
+            var className = new StringBuilder(256);
+            GetClassName(hWnd, className, className.Capacity);
+            if (!className.ToString().StartsWith("Chrome_WidgetWin"))
+            {
+                return true;
+            }
+
+            uint processId;
+            GetWindowThreadProcessId(hWnd, out processId);
+
+            try
+            {
+                string processName = Process.GetProcessById((int)processId)
+                    .ProcessName.ToLowerInvariant();
+                if (processName == "chrome" || processName == "msedge")
+                {
+                    windows.Add(hWnd);
+                }
+            }
+            catch
+            {
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return windows.ToArray();
+    }
+}
+"@
+
+$browser = $null
+foreach ($handle in [BrowserWindowFinder]::GetWindows()) {
+    try {
+        $candidate = [System.Windows.Automation.AutomationElement]::FromHandle(
+            $handle
+        )
+        if (-not [string]::IsNullOrWhiteSpace($candidate.Current.Name)) {
+            $browser = $candidate
+            break
+        }
+    } catch {
+    }
+}
+
+if ($null -eq $browser) {
+    throw "Chrome or Edge window was not found."
+}
+
+$editCondition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$edits = $browser.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $editCondition
+)
+$candidates = @()
+
+foreach ($edit in $edits) {
+    try {
+        $name = $edit.Current.Name
+        $valuePattern = $edit.GetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern
+        )
+        $value = $valuePattern.Current.Value
+
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+
+        $isUrl = (
+            $value -match "^[a-zA-Z][a-zA-Z0-9+.-]*:" -or
+            $value -match "^[^\s]+\.[^\s]+"
+        )
+        if (-not $isUrl) {
+            continue
+        }
+
+        $score = 0
+        if ($name -match "(?i)address|location|url|アドレス") {
+            $score += 100
+        }
+        if ($value -match "^[a-zA-Z][a-zA-Z0-9+.-]*:") {
+            $score += 50
+        } else {
+            $score += 10
+        }
+
+        if ($score -gt 0) {
+            $candidates += [PSCustomObject]@{
+                Value = $value
+                Score = $score
+            }
+        }
+    } catch {
+    }
+}
+
+$address = $candidates |
+    Sort-Object Score -Descending |
+    Select-Object -First 1
+
+if ($null -eq $address) {
+    throw "Browser address bar was not found."
+}
+
+$title = $browser.Current.Name -replace (
+    "\s+[-–]\s+(Google Chrome|Microsoft Edge)$"
+), ""
+
+[PSCustomObject]@{
+    title = $title
+    url = $address.Value
+} | ConvertTo-Json -Compress
+"""
 
 
 def google_search(query: str) -> str:
@@ -59,9 +229,88 @@ def open_chatgpt() -> str:
     return "https://chatgpt.com/"
 
 
-def save_current_page() -> None:
-    """Chromeで表示中のページをメモへ保存する。"""
-    return None
+def get_current_page() -> tuple[str, str]:
+    """直近のChromeまたはEdgeウィンドウからタイトルとURLを取得する。"""
+    if sys.platform != "win32":
+        raise OSError("現在ページの取得はWindowsでのみ利用できます。")
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            CURRENT_PAGE_SCRIPT,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()
+        raise OSError(
+            "ChromeまたはEdgeのページ情報を取得できませんでした。"
+            "ブラウザを開いてから再実行してください。"
+            + (f"\n{detail}" if detail else "")
+        )
+
+    try:
+        payload = json.loads(completed.stdout.strip())
+        title = payload["title"].strip()
+        url = payload["url"].strip()
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as error:
+        raise OSError("ブラウザから不正なページ情報が返されました。") from error
+
+    if not title or not url:
+        raise OSError("ブラウザから空のページ情報が返されました。")
+    return title, url
+
+
+def format_saved_page(title: str, url: str) -> str:
+    """ページ情報をMarkdownのリスト項目へ変換する。
+
+    Args:
+        title: 保存するページタイトル。
+        url: 保存するページURL。
+    """
+    safe_title = (
+        title.replace("\r", " ")
+        .replace("\n", " ")
+        .replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+    safe_url = (
+        url.replace("\r", "")
+        .replace("\n", "")
+        .replace("<", "%3C")
+        .replace(">", "%3E")
+    )
+    return f"- [{safe_title}](<{safe_url}>)\n"
+
+
+def save_current_page() -> str:
+    """直近のChromeまたはEdgeのページをMarkdownメモへ保存する。"""
+    title, url = get_current_page()
+    needs_heading = (
+        not SAVED_PAGES_PATH.exists()
+        or SAVED_PAGES_PATH.stat().st_size == 0
+    )
+
+    with SAVED_PAGES_PATH.open("a", encoding="utf-8", newline="\n") as memo:
+        if needs_heading:
+            memo.write("# Saved Pages\n\n")
+        memo.write(format_saved_page(title, url))
+
+    return f"ページを保存しました: {title}\n{SAVED_PAGES_PATH}"
 
 
 def open_recycle_bin() -> str:
@@ -218,6 +467,9 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
                 "content": (
                     "ユーザーの依頼に最適なツールを必ず1つ選んでください。"
                     "引数では依頼文の日本語を保持し、他言語へ翻訳しないでください。"
+                    "「今のページを保存して」「このページをメモして」のように、"
+                    "現在表示しているページを保存またはメモする依頼では"
+                    "必ずsave_current_pageを選んでください。"
                     "ゴミ箱の内容を見たい依頼ではopen_recycle_binを、"
                     "完全に削除したい依頼でのみempty_recycle_binを選んでください。"
                 ),
