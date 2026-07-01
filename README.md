@@ -198,6 +198,13 @@ uv run --project "$HOME\workspace" "$HOME\workspace\main.py" ...
 act ...
 ```
 
+登録済み操作の関数名、引数、説明を一覧表示する場合は、`--list`または`-l`を使います。
+この表示ではOllamaへの接続や操作の実行は行いません。
+
+```powershell
+act --list
+```
+
 ### 配置場所
 
 現在の`act.cmd`は次の場所にあります。

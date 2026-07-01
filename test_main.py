@@ -245,6 +245,30 @@ class SelectActionTests(unittest.TestCase):
             main.select_action("複数の操作")
 
 
+class CommandLineOptionTests(unittest.TestCase):
+    def test_format_action_list_contains_registered_actions(self) -> None:
+        result = main.format_action_list()
+
+        self.assertIn(f"利用できる操作（{len(main.actions)}件）", result)
+        self.assertIn("google_search(query)", result)
+        self.assertIn("open_chatgpt()", result)
+        self.assertIn("Googleで検索する。", result)
+        self.assertIn("empty_recycle_bin() [実行前に確認]", result)
+
+    @patch("main.select_action")
+    @patch("main.print")
+    def test_list_option_does_not_call_ollama(
+        self,
+        print_function: Mock,
+        select_action: Mock,
+    ) -> None:
+        with patch("main.sys.argv", ["main.py", "--list"]):
+            main.main()
+
+        select_action.assert_not_called()
+        print_function.assert_called_once_with(main.format_action_list())
+
+
 class RecycleBinActionTests(unittest.TestCase):
     @patch("main.os.startfile")
     def test_open_recycle_bin_uses_shell_folder(self, startfile: Mock) -> None:

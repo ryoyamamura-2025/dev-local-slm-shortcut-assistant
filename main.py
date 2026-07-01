@@ -609,6 +609,20 @@ actions = {
 }
 
 
+def format_action_list() -> str:
+    """登録済み操作の関数名、引数、説明を一覧表示用に整形する。"""
+    lines = [f"利用できる操作（{len(actions)}件）:"]
+    for name, action in actions.items():
+        parameters = ", ".join(
+            inspect.signature(action.function).parameters
+        )
+        description = (inspect.getdoc(action.function) or "説明はありません。").splitlines()[0]
+        confirmation = " [実行前に確認]" if action.confirmation_message else ""
+        lines.append(f"  {name}({parameters}){confirmation}")
+        lines.append(f"    {description}")
+    return "\n".join(lines)
+
+
 def confirm_action(
     message: str,
     input_function: Callable[[str], str] = input,
@@ -748,7 +762,12 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
 
 def main() -> None:
     """自然文から登録済み操作を選択し、安全設定に従って実行する。"""
-    request = " ".join(sys.argv[1:]).strip() or input("指示> ").strip()
+    arguments = sys.argv[1:]
+    if len(arguments) == 1 and arguments[0] in {"--list", "-l"}:
+        print(format_action_list())
+        return
+
+    request = " ".join(arguments).strip() or input("指示> ").strip()
     name, arguments = select_action(request)
     arguments = normalize_action_arguments(name, arguments)
     result = {"operation": name, **arguments}
