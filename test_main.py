@@ -39,7 +39,7 @@ class SaveCurrentPageTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             memo_path = Path(directory) / "saved_pages.md"
-            with patch("main.SAVED_PAGES_PATH", memo_path):
+            with patch("main.get_saved_pages_path", return_value=memo_path):
                 result = main.save_current_page()
                 main.save_current_page()
 
@@ -95,6 +95,154 @@ class SaveCurrentPageTests(unittest.TestCase):
             self.assertRaisesRegex(OSError, "ページ情報を取得できません"),
         ):
             main.get_current_page()
+
+
+class OneDriveNoteTests(unittest.TestCase):
+    def test_get_onedrive_directory_uses_consumer_folder(self) -> None:
+        with TemporaryDirectory() as directory:
+            with (
+                patch("main.sys.platform", "win32"),
+                patch.dict(
+                    main.os.environ,
+                    {"OneDriveConsumer": directory},
+                    clear=True,
+                ),
+            ):
+                self.assertEqual(
+                    main.get_onedrive_directory(),
+                    Path(directory) / "Local Actions",
+                )
+
+    def test_get_onedrive_directory_reports_missing_configuration(self) -> None:
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.dict(main.os.environ, {}, clear=True),
+            self.assertRaisesRegex(OSError, "OneDriveフォルダを特定"),
+        ):
+            main.get_onedrive_directory()
+
+    def test_format_text_note_preserves_multiline_text(self) -> None:
+        self.assertEqual(
+            main.format_text_note("買い物\r\n牛乳\nパン"),
+            "- 買い物\n  牛乳\n  パン\n",
+        )
+
+    def test_create_text_note_appends_utf8_markdown(self) -> None:
+        with TemporaryDirectory() as directory:
+            notes_path = Path(directory) / "Local Actions" / "notes.md"
+            with patch("main.get_notes_path", return_value=notes_path):
+                result = main.create_text_note("牛乳を買う")
+                main.create_text_note("パンを買う")
+
+            self.assertEqual(
+                notes_path.read_text(encoding="utf-8"),
+                "# Notes\n\n- 牛乳を買う\n- パンを買う\n",
+            )
+
+        self.assertIn(str(notes_path), result)
+
+
+class WindowsActionTests(unittest.TestCase):
+    @patch("main.os.startfile")
+    def test_open_downloads_folder_opens_current_user_folder(
+        self,
+        startfile: Mock,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            downloads = home / "Downloads"
+            downloads.mkdir()
+            with (
+                patch("main.sys.platform", "win32"),
+                patch("main.Path.home", return_value=home),
+            ):
+                result = main.open_downloads_folder()
+
+        startfile.assert_called_once_with(downloads)
+        self.assertIn(str(downloads), result)
+
+    @patch("main.os.startfile")
+    def test_open_settings_uses_allowlisted_uri(self, startfile: Mock) -> None:
+        with patch("main.sys.platform", "win32"):
+            result = main.open_settings("windows_update")
+
+        startfile.assert_called_once_with("ms-settings:windowsupdate")
+        self.assertIn("Windows Update", result)
+
+    def test_open_settings_rejects_unknown_page(self) -> None:
+        with (
+            patch("main.sys.platform", "win32"),
+            self.assertRaisesRegex(ValueError, "未対応の設定ページ"),
+        ):
+            main.open_settings("arbitrary")  # type: ignore[arg-type]
+
+    @patch("main.run_clipboard_script")
+    def test_copy_text_passes_text_without_modification(
+        self,
+        run_script: Mock,
+    ) -> None:
+        text = "日本語\nをそのまま"
+        result = main.copy_text(text)
+
+        run_script.assert_called_once_with(main.COPY_TEXT_SCRIPT, text)
+        self.assertIn(f"{len(text)}文字", result)
+
+    @patch("main.run_clipboard_script", return_value="コピー済みの内容")
+    def test_get_clipboard_text_returns_script_output(
+        self,
+        run_script: Mock,
+    ) -> None:
+        self.assertEqual(main.get_clipboard_text(), "コピー済みの内容")
+        run_script.assert_called_once_with(main.GET_CLIPBOARD_TEXT_SCRIPT)
+
+    @patch("main.shutil.disk_usage")
+    def test_show_system_info_formats_windows_and_disk_data(
+        self,
+        disk_usage: Mock,
+    ) -> None:
+        disk_usage.return_value = Mock(
+            total=100 * 1024 ** 3,
+            used=40 * 1024 ** 3,
+            free=60 * 1024 ** 3,
+        )
+        windows_version = Mock(build=26100)
+
+        with (
+            patch("main.sys.platform", "win32"),
+            patch("main.sys.getwindowsversion", return_value=windows_version),
+            patch("main.platform.win32_ver", return_value=("11", "10.0", "", "")),
+            patch("main.platform.win32_edition", return_value="Professional"),
+            patch("main.platform.node", return_value="TEST-PC"),
+            patch.dict(main.os.environ, {"SystemDrive": "D:"}),
+        ):
+            result = main.show_system_info()
+
+        disk_usage.assert_called_once_with("D:\\")
+        self.assertIn("Windows Professional 11", result)
+        self.assertIn("ビルド 26100", result)
+        self.assertIn("空き容量: 60.0 GiB", result)
+
+    @patch("main.ctypes.windll.user32.LockWorkStation", return_value=1)
+    def test_lock_pc_runs_without_confirmation(self, lock: Mock) -> None:
+        with patch("main.sys.platform", "win32"):
+            self.assertEqual(main.lock_pc(), "PCをロックしました。")
+
+        lock.assert_called_once_with()
+        self.assertIsNone(main.actions["lock_pc"].confirmation_message)
+
+
+class SelectActionTests(unittest.TestCase):
+    @patch("main.chat")
+    def test_single_action_mode_rejects_multiple_tool_calls(
+        self,
+        chat: Mock,
+    ) -> None:
+        chat.return_value = Mock(
+            message=Mock(tool_calls=[Mock(), Mock()]),
+        )
+
+        with self.assertRaisesRegex(SystemExit, "操作を1つだけ"):
+            main.select_action("複数の操作")
 
 
 class RecycleBinActionTests(unittest.TestCase):

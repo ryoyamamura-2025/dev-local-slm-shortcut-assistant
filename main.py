@@ -2,19 +2,67 @@ import ctypes
 import inspect
 import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 from ollama import chat
 
 
-SAVED_PAGES_PATH = Path(__file__).with_name("saved_pages.md")
+SettingsPage = Literal[
+    "system",
+    "display",
+    "sound",
+    "notifications",
+    "network",
+    "bluetooth",
+    "apps",
+    "default_apps",
+    "storage",
+    "power",
+    "privacy",
+    "windows_update",
+]
+
+SETTINGS_PAGES: dict[str, tuple[str, str]] = {
+    "system": ("システム情報", "ms-settings:about"),
+    "display": ("ディスプレイ", "ms-settings:display"),
+    "sound": ("サウンド", "ms-settings:sound"),
+    "notifications": ("通知", "ms-settings:notifications"),
+    "network": ("ネットワークとインターネット", "ms-settings:network-status"),
+    "bluetooth": ("Bluetoothとデバイス", "ms-settings:bluetooth"),
+    "apps": ("インストールされているアプリ", "ms-settings:appsfeatures"),
+    "default_apps": ("既定のアプリ", "ms-settings:defaultapps"),
+    "storage": ("ストレージ", "ms-settings:storagesense"),
+    "power": ("電源", "ms-settings:powersleep"),
+    "privacy": ("プライバシーとセキュリティ", "ms-settings:privacy"),
+    "windows_update": ("Windows Update", "ms-settings:windowsupdate"),
+}
+
+COPY_TEXT_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+$text = [Console]::In.ReadToEnd()
+[System.Windows.Forms.Clipboard]::SetText($text)
+"""
+
+GET_CLIPBOARD_TEXT_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+if (-not [System.Windows.Forms.Clipboard]::ContainsText()) {
+    throw "The clipboard does not contain text."
+}
+[Console]::Out.Write([System.Windows.Forms.Clipboard]::GetText())
+"""
 
 CURRENT_PAGE_SCRIPT = r"""
 $ErrorActionPreference = "Stop"
@@ -229,6 +277,153 @@ def open_chatgpt() -> str:
     return "https://chatgpt.com/"
 
 
+def get_onedrive_directory() -> Path:
+    """現在のユーザーのOneDrive内にあるアプリ用フォルダを返す。"""
+    if sys.platform != "win32":
+        raise OSError("OneDriveへの保存はWindowsでのみ利用できます。")
+
+    for variable in ("OneDriveConsumer", "OneDrive", "OneDriveCommercial"):
+        value = os.environ.get(variable)
+        if value and Path(value).is_dir():
+            return Path(value) / "Local Actions"
+
+    raise OSError(
+        "OneDriveフォルダを特定できませんでした。"
+        "OneDriveへサインインしてから再実行してください。"
+    )
+
+
+def get_saved_pages_path() -> Path:
+    """保存したページを書き込むOneDrive上のファイルパスを返す。"""
+    return get_onedrive_directory() / "saved_pages.md"
+
+
+def get_notes_path() -> Path:
+    """テキストメモを書き込むOneDrive上のファイルパスを返す。"""
+    return get_onedrive_directory() / "notes.md"
+
+
+def open_downloads_folder() -> str:
+    """現在のユーザーのダウンロードフォルダをExplorerで開く。"""
+    if sys.platform != "win32":
+        raise OSError("ダウンロードフォルダを開く操作はWindowsでのみ利用できます。")
+
+    downloads = Path.home() / "Downloads"
+    if not downloads.is_dir():
+        raise OSError(f"ダウンロードフォルダが見つかりません: {downloads}")
+    os.startfile(downloads)
+    return f"ダウンロードフォルダを開きました。\n{downloads}"
+
+
+def open_settings(page: SettingsPage) -> str:
+    """許可済みのWindows設定ページを開く。
+
+    Args:
+        page: 開くページ。system、display、sound、notifications、network、
+            bluetooth、apps、default_apps、storage、power、privacy、
+            windows_updateのいずれか。
+    """
+    if sys.platform != "win32":
+        raise OSError("Windows設定を開く操作はWindowsでのみ利用できます。")
+
+    setting = SETTINGS_PAGES.get(page)
+    if setting is None:
+        allowed = ", ".join(SETTINGS_PAGES)
+        raise ValueError(f"未対応の設定ページです: {page}（許可値: {allowed}）")
+
+    label, uri = setting
+    os.startfile(uri)
+    return f"Windows設定の「{label}」を開きました。"
+
+
+def run_clipboard_script(script: str, text: str | None = None) -> str:
+    """固定PowerShellスクリプトでWindowsクリップボードを操作する。
+
+    Args:
+        script: Python側で定義した固定スクリプト。
+        text: スクリプトへUTF-8で渡す標準入力。
+    """
+    if sys.platform != "win32":
+        raise OSError("クリップボード操作はWindowsでのみ利用できます。")
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-Command",
+            script,
+        ],
+        input=text,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()
+        raise OSError(
+            "クリップボードを操作できませんでした。"
+            + (f"\n{detail}" if detail else "")
+        )
+    return completed.stdout
+
+
+def copy_text(text: str) -> str:
+    """指定されたテキストを改変せずクリップボードへコピーする。
+
+    Args:
+        text: コピーするテキスト。
+    """
+    if not text:
+        raise ValueError("コピーするテキストが空です。")
+    run_clipboard_script(COPY_TEXT_SCRIPT, text)
+    return f"テキストをクリップボードへコピーしました（{len(text)}文字）。"
+
+
+def get_clipboard_text() -> str:
+    """クリップボードにあるテキストを取得する。"""
+    text = run_clipboard_script(GET_CLIPBOARD_TEXT_SCRIPT)
+    if not text:
+        raise ValueError("クリップボードのテキストが空です。")
+    return text
+
+
+def format_text_note(text: str) -> str:
+    """テキストをMarkdownのリスト項目へ変換する。
+
+    Args:
+        text: メモへ追記するテキスト。
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        raise ValueError("メモするテキストが空です。")
+    lines = normalized.splitlines()
+    return "- " + "\n  ".join(lines) + "\n"
+
+
+def create_text_note(text: str) -> str:
+    """指定されたテキストをOneDrive上の固定メモへ追記する。
+
+    Args:
+        text: 日本語や改行を保持して追記する内容。
+    """
+    entry = format_text_note(text)
+    notes_path = get_notes_path()
+    notes_path.parent.mkdir(parents=True, exist_ok=True)
+    needs_heading = not notes_path.exists() or notes_path.stat().st_size == 0
+
+    with notes_path.open("a", encoding="utf-8", newline="\n") as memo:
+        if needs_heading:
+            memo.write("# Notes\n\n")
+        memo.write(entry)
+
+    return f"メモを保存しました。\n{notes_path}"
+
+
 def get_current_page() -> tuple[str, str]:
     """直近のChromeまたはEdgeウィンドウからタイトルとURLを取得する。"""
     if sys.platform != "win32":
@@ -300,23 +495,69 @@ def format_saved_page(title: str, url: str) -> str:
 def save_current_page() -> str:
     """直近のChromeまたはEdgeのページをMarkdownメモへ保存する。"""
     title, url = get_current_page()
+    saved_pages_path = get_saved_pages_path()
+    saved_pages_path.parent.mkdir(parents=True, exist_ok=True)
     needs_heading = (
-        not SAVED_PAGES_PATH.exists()
-        or SAVED_PAGES_PATH.stat().st_size == 0
+        not saved_pages_path.exists()
+        or saved_pages_path.stat().st_size == 0
     )
 
-    with SAVED_PAGES_PATH.open("a", encoding="utf-8", newline="\n") as memo:
+    with saved_pages_path.open("a", encoding="utf-8", newline="\n") as memo:
         if needs_heading:
             memo.write("# Saved Pages\n\n")
         memo.write(format_saved_page(title, url))
 
-    return f"ページを保存しました: {title}\n{SAVED_PAGES_PATH}"
+    return f"ページを保存しました: {title}\n{saved_pages_path}"
 
 
-# def open_recycle_bin() -> str:
-#     """Windowsのゴミ箱を開いて内容を表示する。"""
-#     os.startfile("shell:RecycleBinFolder")
-#     return "ゴミ箱を開きました。"
+def open_recycle_bin() -> str:
+    """Windowsのゴミ箱を開いて内容を表示する。"""
+    os.startfile("shell:RecycleBinFolder")
+    return "ゴミ箱を開きました。"
+
+
+def format_bytes(size: int) -> str:
+    """バイト数を小数1桁のGiB表記へ変換する。
+
+    Args:
+        size: 変換するバイト数。
+    """
+    return f"{size / (1024 ** 3):.1f} GiB"
+
+
+def show_system_info() -> str:
+    """OSとシステムドライブの容量を取得して表示用テキストを返す。"""
+    if sys.platform != "win32":
+        raise OSError("システム情報の表示はWindowsでのみ利用できます。")
+
+    release, version, _, _ = platform.win32_ver()
+    edition = platform.win32_edition()
+    build = sys.getwindowsversion().build
+    system_drive = os.environ.get("SystemDrive", "C:")
+    usage = shutil.disk_usage(system_drive + "\\")
+
+    os_name = " ".join(part for part in ("Windows", edition, release) if part)
+    return "\n".join(
+        [
+            f"OS: {os_name}",
+            f"バージョン: {version or '不明'}（ビルド {build}）",
+            f"コンピューター名: {platform.node() or '不明'}",
+            f"システムドライブ: {system_drive}",
+            f"総容量: {format_bytes(usage.total)}",
+            f"使用量: {format_bytes(usage.used)}",
+            f"空き容量: {format_bytes(usage.free)}",
+        ]
+    )
+
+
+def lock_pc() -> str:
+    """確認を挟まず現在のWindowsセッションをロックする。"""
+    if sys.platform != "win32":
+        raise OSError("PCのロックはWindowsでのみ利用できます。")
+
+    if not ctypes.windll.user32.LockWorkStation():
+        raise OSError("PCをロックできませんでした。")
+    return "PCをロックしました。"
 
 
 def empty_recycle_bin() -> str:
@@ -349,8 +590,14 @@ actions = {
         Action(x_search, open_result_in_browser=True),
         Action(open_url, open_result_in_browser=True),
         Action(open_chatgpt, open_result_in_browser=True),
+        Action(open_downloads_folder),
+        Action(open_settings),
+        Action(copy_text),
+        Action(create_text_note),
+        Action(get_clipboard_text),
+        Action(show_system_info),
+        Action(lock_pc),
         Action(save_current_page),
-        # Action(open_recycle_bin),
         Action(
             empty_recycle_bin,
             confirmation_message=(
@@ -470,6 +717,16 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
                     "「今のページを保存して」「このページをメモして」のように、"
                     "現在表示しているページを保存またはメモする依頼では"
                     "必ずsave_current_pageを選んでください。"
+                    "指定された文章をメモする依頼はcreate_text_noteを選んでください。"
+                    "文章をクリップボードへコピーする依頼はcopy_text、"
+                    "クリップボードの内容を表示する依頼はget_clipboard_textを"
+                    "選んでください。"
+                    "「牛乳を買うとメモして」はcreate_text_noteを選び、"
+                    "textには「牛乳を買う」を指定してください。"
+                    "「クリップボードの内容を見せて」は"
+                    "get_clipboard_textを選んでください。"
+                    "「YouTubeを開いて」はopen_urlを選び、"
+                    "urlにはhttps://www.youtube.com/を指定してください。"
                     "ゴミ箱の中身を完全に削除したい依頼はempty_recycle_binを選んでください。"
                 ),
             },
@@ -482,6 +739,8 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
 
     if not response.message.tool_calls:
         raise SystemExit("操作を判定できませんでした。")
+    if len(response.message.tool_calls) != 1:
+        raise SystemExit("単発実行では操作を1つだけ指定してください。")
 
     call = response.message.tool_calls[0]
     return call.function.name, call.function.arguments
