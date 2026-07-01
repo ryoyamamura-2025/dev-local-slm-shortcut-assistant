@@ -313,10 +313,10 @@ def save_current_page() -> str:
     return f"ページを保存しました: {title}\n{SAVED_PAGES_PATH}"
 
 
-def open_recycle_bin() -> str:
-    """Windowsのゴミ箱を開いて内容を表示する。"""
-    os.startfile("shell:RecycleBinFolder")
-    return "ゴミ箱を開きました。"
+# def open_recycle_bin() -> str:
+#     """Windowsのゴミ箱を開いて内容を表示する。"""
+#     os.startfile("shell:RecycleBinFolder")
+#     return "ゴミ箱を開きました。"
 
 
 def empty_recycle_bin() -> str:
@@ -350,7 +350,7 @@ actions = {
         Action(open_url, open_result_in_browser=True),
         Action(open_chatgpt, open_result_in_browser=True),
         Action(save_current_page),
-        Action(open_recycle_bin),
+        # Action(open_recycle_bin),
         Action(
             empty_recycle_bin,
             confirmation_message=(
@@ -470,8 +470,7 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
                     "「今のページを保存して」「このページをメモして」のように、"
                     "現在表示しているページを保存またはメモする依頼では"
                     "必ずsave_current_pageを選んでください。"
-                    "ゴミ箱の内容を見たい依頼ではopen_recycle_binを、"
-                    "完全に削除したい依頼でのみempty_recycle_binを選んでください。"
+                    "ゴミ箱の中身を完全に削除したい依頼はempty_recycle_binを選んでください。"
                 ),
             },
             {"role": "user", "content": request},
