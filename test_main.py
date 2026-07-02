@@ -153,7 +153,7 @@ class OneDriveNoteTests(unittest.TestCase):
 
 class WindowsActionTests(unittest.TestCase):
     @patch("local_actions.actions.os.startfile")
-    def test_open_downloads_folder_opens_current_user_folder(
+    def test_open_folder_opens_downloads_folder(
         self,
         startfile: Mock,
     ) -> None:
@@ -165,10 +165,39 @@ class WindowsActionTests(unittest.TestCase):
                 patch("local_actions.actions.sys.platform", "win32"),
                 patch("local_actions.actions.Path.home", return_value=home),
             ):
-                result = main.open_downloads_folder()
+                result = main.open_folder("downloads")
 
         startfile.assert_called_once_with(downloads)
         self.assertIn(str(downloads), result)
+
+    @patch("local_actions.actions.os.startfile")
+    def test_open_folder_opens_onedrive_save_directory(
+        self,
+        startfile: Mock,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            onedrive = Path(directory)
+            save_directory = onedrive / "Local Actions"
+            save_directory.mkdir()
+            with (
+                patch("local_actions.actions.sys.platform", "win32"),
+                patch.dict(
+                    main.os.environ,
+                    {"OneDriveConsumer": str(onedrive)},
+                    clear=True,
+                ),
+            ):
+                result = main.open_folder("onedrive")
+
+        startfile.assert_called_once_with(save_directory)
+        self.assertIn(str(save_directory), result)
+
+    def test_open_folder_rejects_unknown_folder(self) -> None:
+        with (
+            patch("local_actions.actions.sys.platform", "win32"),
+            self.assertRaisesRegex(ValueError, "未対応のフォルダ"),
+        ):
+            main.open_folder("arbitrary")  # type: ignore[arg-type]
 
     @patch("local_actions.actions.os.startfile")
     def test_open_settings_uses_allowlisted_uri(self, startfile: Mock) -> None:
@@ -279,6 +308,7 @@ class CommandLineOptionTests(unittest.TestCase):
         self.assertIn(f"利用できる操作（{len(registry.actions)}件）", result)
         self.assertIn("google_search(query)", result)
         self.assertIn("open_chatgpt()", result)
+        self.assertIn("open_folder(folder)", result)
         self.assertIn("Googleで検索する。", result)
         self.assertIn("empty_recycle_bin() [実行前に確認]", result)
 

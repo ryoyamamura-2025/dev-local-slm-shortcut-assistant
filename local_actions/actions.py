@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlencode
@@ -304,7 +305,7 @@ def get_downloads_directory() -> Path:
     return Path.home() / "Downloads"
 
 
-FOLDERS: dict[str, tuple[str, object]] = {
+FOLDERS: dict[str, tuple[str, Callable[[], Path]]] = {
     "onedrive": ("OneDriveの保存先", get_onedrive_directory),
     "downloads": ("ダウンロードフォルダ", get_downloads_directory),
 }

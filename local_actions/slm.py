@@ -32,6 +32,10 @@ def select_action(request: str) -> tuple[str, dict[str, Any]]:
                     "get_clipboard_textを選んでください。"
                     "「YouTubeを開いて」はopen_urlを選び、"
                     "urlにはhttps://www.youtube.com/を指定してください。"
+                    "OneDriveの保存先を開く依頼はopen_folderを選び、"
+                    "folderにはonedriveを指定してください。"
+                    "ダウンロードフォルダを開く依頼はopen_folderを選び、"
+                    "folderにはdownloadsを指定してください。"
                     "ゴミ箱の中身を完全に削除したい依頼はempty_recycle_binを選んでください。"
                 ),
             },
