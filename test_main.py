@@ -1,9 +1,12 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-import main
+from local_actions import action_log
+from local_actions import actions as main
+from local_actions import cli, registry, slm
 
 
 class UrlActionTests(unittest.TestCase):
@@ -27,7 +30,7 @@ class SaveCurrentPageTests(unittest.TestCase):
             r"- [Example \[page\]](<https://example.com/a%3Eb>)" + "\n",
         )
 
-    @patch("main.get_current_page")
+    @patch("local_actions.actions.get_current_page")
     def test_save_current_page_appends_utf8_markdown(
         self,
         get_current_page: Mock,
@@ -39,7 +42,10 @@ class SaveCurrentPageTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             memo_path = Path(directory) / "saved_pages.md"
-            with patch("main.get_saved_pages_path", return_value=memo_path):
+            with patch(
+                "local_actions.actions.get_saved_pages_path",
+                return_value=memo_path,
+            ):
                 result = main.save_current_page()
                 main.save_current_page()
 
@@ -54,7 +60,7 @@ class SaveCurrentPageTests(unittest.TestCase):
 
         self.assertIn("ページを保存しました", result)
 
-    @patch("main.subprocess.run")
+    @patch("local_actions.actions.subprocess.run")
     def test_get_current_page_parses_ui_automation_result(
         self,
         run: Mock,
@@ -65,7 +71,7 @@ class SaveCurrentPageTests(unittest.TestCase):
             stderr="",
         )
 
-        with patch("main.sys.platform", "win32"):
+        with patch("local_actions.actions.sys.platform", "win32"):
             self.assertEqual(
                 main.get_current_page(),
                 ("Example", "https://example.com"),
@@ -79,7 +85,7 @@ class SaveCurrentPageTests(unittest.TestCase):
             "-Command",
         ])
 
-    @patch("main.subprocess.run")
+    @patch("local_actions.actions.subprocess.run")
     def test_get_current_page_reports_ui_automation_failure(
         self,
         run: Mock,
@@ -91,7 +97,7 @@ class SaveCurrentPageTests(unittest.TestCase):
         )
 
         with (
-            patch("main.sys.platform", "win32"),
+            patch("local_actions.actions.sys.platform", "win32"),
             self.assertRaisesRegex(OSError, "ページ情報を取得できません"),
         ):
             main.get_current_page()
@@ -101,7 +107,7 @@ class OneDriveNoteTests(unittest.TestCase):
     def test_get_onedrive_directory_uses_consumer_folder(self) -> None:
         with TemporaryDirectory() as directory:
             with (
-                patch("main.sys.platform", "win32"),
+                patch("local_actions.actions.sys.platform", "win32"),
                 patch.dict(
                     main.os.environ,
                     {"OneDriveConsumer": directory},
@@ -115,7 +121,7 @@ class OneDriveNoteTests(unittest.TestCase):
 
     def test_get_onedrive_directory_reports_missing_configuration(self) -> None:
         with (
-            patch("main.sys.platform", "win32"),
+            patch("local_actions.actions.sys.platform", "win32"),
             patch.dict(main.os.environ, {}, clear=True),
             self.assertRaisesRegex(OSError, "OneDriveフォルダを特定"),
         ):
@@ -130,7 +136,10 @@ class OneDriveNoteTests(unittest.TestCase):
     def test_create_text_note_appends_utf8_markdown(self) -> None:
         with TemporaryDirectory() as directory:
             notes_path = Path(directory) / "Local Actions" / "notes.md"
-            with patch("main.get_notes_path", return_value=notes_path):
+            with patch(
+                "local_actions.actions.get_notes_path",
+                return_value=notes_path,
+            ):
                 result = main.create_text_note("牛乳を買う")
                 main.create_text_note("パンを買う")
 
@@ -143,7 +152,7 @@ class OneDriveNoteTests(unittest.TestCase):
 
 
 class WindowsActionTests(unittest.TestCase):
-    @patch("main.os.startfile")
+    @patch("local_actions.actions.os.startfile")
     def test_open_downloads_folder_opens_current_user_folder(
         self,
         startfile: Mock,
@@ -153,17 +162,17 @@ class WindowsActionTests(unittest.TestCase):
             downloads = home / "Downloads"
             downloads.mkdir()
             with (
-                patch("main.sys.platform", "win32"),
-                patch("main.Path.home", return_value=home),
+                patch("local_actions.actions.sys.platform", "win32"),
+                patch("local_actions.actions.Path.home", return_value=home),
             ):
                 result = main.open_downloads_folder()
 
         startfile.assert_called_once_with(downloads)
         self.assertIn(str(downloads), result)
 
-    @patch("main.os.startfile")
+    @patch("local_actions.actions.os.startfile")
     def test_open_settings_uses_allowlisted_uri(self, startfile: Mock) -> None:
-        with patch("main.sys.platform", "win32"):
+        with patch("local_actions.actions.sys.platform", "win32"):
             result = main.open_settings("windows_update")
 
         startfile.assert_called_once_with("ms-settings:windowsupdate")
@@ -171,12 +180,12 @@ class WindowsActionTests(unittest.TestCase):
 
     def test_open_settings_rejects_unknown_page(self) -> None:
         with (
-            patch("main.sys.platform", "win32"),
+            patch("local_actions.actions.sys.platform", "win32"),
             self.assertRaisesRegex(ValueError, "未対応の設定ページ"),
         ):
             main.open_settings("arbitrary")  # type: ignore[arg-type]
 
-    @patch("main.run_clipboard_script")
+    @patch("local_actions.actions.run_clipboard_script")
     def test_copy_text_passes_text_without_modification(
         self,
         run_script: Mock,
@@ -187,7 +196,10 @@ class WindowsActionTests(unittest.TestCase):
         run_script.assert_called_once_with(main.COPY_TEXT_SCRIPT, text)
         self.assertIn(f"{len(text)}文字", result)
 
-    @patch("main.run_clipboard_script", return_value="コピー済みの内容")
+    @patch(
+        "local_actions.actions.run_clipboard_script",
+        return_value="コピー済みの内容",
+    )
     def test_get_clipboard_text_returns_script_output(
         self,
         run_script: Mock,
@@ -195,7 +207,7 @@ class WindowsActionTests(unittest.TestCase):
         self.assertEqual(main.get_clipboard_text(), "コピー済みの内容")
         run_script.assert_called_once_with(main.GET_CLIPBOARD_TEXT_SCRIPT)
 
-    @patch("main.shutil.disk_usage")
+    @patch("local_actions.actions.shutil.disk_usage")
     def test_show_system_info_formats_windows_and_disk_data(
         self,
         disk_usage: Mock,
@@ -208,11 +220,23 @@ class WindowsActionTests(unittest.TestCase):
         windows_version = Mock(build=26100)
 
         with (
-            patch("main.sys.platform", "win32"),
-            patch("main.sys.getwindowsversion", return_value=windows_version),
-            patch("main.platform.win32_ver", return_value=("11", "10.0", "", "")),
-            patch("main.platform.win32_edition", return_value="Professional"),
-            patch("main.platform.node", return_value="TEST-PC"),
+            patch("local_actions.actions.sys.platform", "win32"),
+            patch(
+                "local_actions.actions.sys.getwindowsversion",
+                return_value=windows_version,
+            ),
+            patch(
+                "local_actions.actions.platform.win32_ver",
+                return_value=("11", "10.0", "", ""),
+            ),
+            patch(
+                "local_actions.actions.platform.win32_edition",
+                return_value="Professional",
+            ),
+            patch(
+                "local_actions.actions.platform.node",
+                return_value="TEST-PC",
+            ),
             patch.dict(main.os.environ, {"SystemDrive": "D:"}),
         ):
             result = main.show_system_info()
@@ -222,17 +246,20 @@ class WindowsActionTests(unittest.TestCase):
         self.assertIn("ビルド 26100", result)
         self.assertIn("空き容量: 60.0 GiB", result)
 
-    @patch("main.ctypes.windll.user32.LockWorkStation", return_value=1)
+    @patch(
+        "local_actions.actions.ctypes.windll.user32.LockWorkStation",
+        return_value=1,
+    )
     def test_lock_pc_runs_without_confirmation(self, lock: Mock) -> None:
-        with patch("main.sys.platform", "win32"):
+        with patch("local_actions.actions.sys.platform", "win32"):
             self.assertEqual(main.lock_pc(), "PCをロックしました。")
 
         lock.assert_called_once_with()
-        self.assertIsNone(main.actions["lock_pc"].confirmation_message)
+        self.assertIsNone(registry.actions["lock_pc"].confirmation_message)
 
 
 class SelectActionTests(unittest.TestCase):
-    @patch("main.chat")
+    @patch("local_actions.slm.chat")
     def test_single_action_mode_rejects_multiple_tool_calls(
         self,
         chat: Mock,
@@ -242,51 +269,149 @@ class SelectActionTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(SystemExit, "操作を1つだけ"):
-            main.select_action("複数の操作")
+            slm.select_action("複数の操作")
 
 
 class CommandLineOptionTests(unittest.TestCase):
     def test_format_action_list_contains_registered_actions(self) -> None:
-        result = main.format_action_list()
+        result = registry.format_action_list()
 
-        self.assertIn(f"利用できる操作（{len(main.actions)}件）", result)
+        self.assertIn(f"利用できる操作（{len(registry.actions)}件）", result)
         self.assertIn("google_search(query)", result)
         self.assertIn("open_chatgpt()", result)
         self.assertIn("Googleで検索する。", result)
         self.assertIn("empty_recycle_bin() [実行前に確認]", result)
 
-    @patch("main.select_action")
-    @patch("main.print")
+    @patch("local_actions.cli.select_action")
+    @patch("local_actions.cli.print")
     def test_list_option_does_not_call_ollama(
         self,
         print_function: Mock,
         select_action: Mock,
     ) -> None:
-        with patch("main.sys.argv", ["main.py", "--list"]):
-            main.main()
+        with patch("local_actions.cli.sys.argv", ["main.py", "--list"]):
+            cli.main()
 
         select_action.assert_not_called()
-        print_function.assert_called_once_with(main.format_action_list())
+        print_function.assert_called_once_with(registry.format_action_list())
+
+
+class ActionLogTests(unittest.TestCase):
+    def test_write_action_log_appends_utf8_json_lines(self) -> None:
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "logs" / "actions.jsonl"
+            with patch(
+                "local_actions.action_log.get_action_log_path",
+                return_value=log_path,
+            ):
+                action_log.write_action_log(
+                    "大分駅の近くを検索して",
+                    "google_search",
+                    {"query": "大分駅の近く"},
+                    "succeeded",
+                    result="https://example.com/日本語",
+                )
+                action_log.write_action_log(
+                    "キャンセルして",
+                    "empty_recycle_bin",
+                    {},
+                    "cancelled",
+                    result="操作をキャンセルしました。",
+                )
+
+            entries = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["request"], "大分駅の近くを検索して")
+        self.assertEqual(entries[0]["arguments"], {"query": "大分駅の近く"})
+        self.assertEqual(entries[0]["status"], "succeeded")
+        self.assertIsNone(entries[0]["error"])
+        self.assertEqual(entries[1]["status"], "cancelled")
+        self.assertIn("T", entries[0]["timestamp"])
+
+    def test_log_path_uses_onedrive_directory(self) -> None:
+        onedrive_directory = Path(r"C:\Users\test\OneDrive\Local Actions")
+        with patch(
+            "local_actions.action_log.get_onedrive_directory",
+            return_value=onedrive_directory,
+        ):
+            self.assertEqual(
+                action_log.get_action_log_path(),
+                onedrive_directory / "actions.jsonl",
+            )
+
+    @patch("local_actions.cli.execute_action")
+    @patch("local_actions.cli.select_action")
+    @patch("local_actions.cli.try_write_action_log")
+    def test_main_records_success(
+        self,
+        write_log: Mock,
+        select_action: Mock,
+        execute_action: Mock,
+    ) -> None:
+        select_action.return_value = ("google_search", {"query": "生成AI"})
+        execute_action.return_value = registry.ActionExecutionResult(
+            "succeeded",
+            "https://www.google.com/search?q=生成AI",
+        )
+
+        with patch("local_actions.cli.sys.argv", ["main.py", "生成AIを検索して"]):
+            cli.main()
+
+        write_log.assert_called_once_with(
+            "生成AIを検索して",
+            "google_search",
+            {"query": "生成AI"},
+            "succeeded",
+            result="https://www.google.com/search?q=生成AI",
+        )
+
+    @patch(
+        "local_actions.cli.select_action",
+        side_effect=RuntimeError("Ollama停止"),
+    )
+    @patch("local_actions.cli.try_write_action_log")
+    def test_main_records_selection_failure(
+        self,
+        write_log: Mock,
+        select_action: Mock,
+    ) -> None:
+        with (
+            patch("local_actions.cli.sys.argv", ["main.py", "検索して"]),
+            self.assertRaisesRegex(RuntimeError, "Ollama停止"),
+        ):
+            cli.main()
+
+        write_log.assert_called_once_with(
+            "検索して",
+            None,
+            {},
+            "failed",
+            error="RuntimeError: Ollama停止",
+        )
 
 
 class RecycleBinActionTests(unittest.TestCase):
-    @patch("main.os.startfile")
+    @patch("local_actions.actions.os.startfile")
     def test_open_recycle_bin_uses_shell_folder(self, startfile: Mock) -> None:
         self.assertEqual(main.open_recycle_bin(), "ゴミ箱を開きました。")
         startfile.assert_called_once_with("shell:RecycleBinFolder")
 
     def test_empty_recycle_bin_requires_confirmation(self) -> None:
-        action = main.actions["empty_recycle_bin"]
+        action = registry.actions["empty_recycle_bin"]
         function = Mock(return_value="ゴミ箱を空にしました。")
 
         with patch.dict(
-            main.actions,
-            {"empty_recycle_bin": main.Action(
+            registry.actions,
+            {"empty_recycle_bin": registry.Action(
                 function,
                 confirmation_message=action.confirmation_message,
             )},
         ):
-            executed = main.execute_action(
+            executed = registry.execute_action(
                 "empty_recycle_bin",
                 {},
                 input_function=lambda _: "n",
@@ -303,13 +428,13 @@ class RecycleBinActionTests(unittest.TestCase):
             return "ゴミ箱を空にしました。"
 
         with patch.dict(
-            main.actions,
-            {"empty_recycle_bin": main.Action(
+            registry.actions,
+            {"empty_recycle_bin": registry.Action(
                 function,
                 confirmation_message="実行しますか？",
             )},
         ):
-            executed = main.execute_action(
+            executed = registry.execute_action(
                 "empty_recycle_bin",
                 {"args": {}},
                 input_function=lambda _: "y",
@@ -320,14 +445,17 @@ class RecycleBinActionTests(unittest.TestCase):
 
     def test_action_with_arguments_rejects_unknown_field(self) -> None:
         with self.assertRaisesRegex(ValueError, "未定義の引数"):
-            main.execute_action(
+            registry.execute_action(
                 "google_search",
                 {"query": "生成AI", "args": {}},
             )
 
-    @patch("main.ctypes.windll.shell32.SHEmptyRecycleBinW", return_value=0)
+    @patch(
+        "local_actions.actions.ctypes.windll.shell32.SHEmptyRecycleBinW",
+        return_value=0,
+    )
     def test_empty_recycle_bin_calls_windows_api(self, empty: Mock) -> None:
-        with patch("main.sys.platform", "win32"):
+        with patch("local_actions.actions.sys.platform", "win32"):
             self.assertEqual(main.empty_recycle_bin(), "ゴミ箱を空にしました。")
 
         empty.assert_called_once_with(None, None, 0x0001 | 0x0002 | 0x0004)

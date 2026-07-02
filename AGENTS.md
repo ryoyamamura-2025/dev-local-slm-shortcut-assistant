@@ -19,6 +19,7 @@
 
 - Windows と PowerShell を前提にする。
 - Python と依存関係は `uv` で管理する。通常は仮想環境を直接操作せず、`uv run ...` を使う。
+- Codex のシェルでは `uv` が `PATH` にない場合がある。`uv` が見つからなければ、`$env:USERPROFILE\AppData\Local\Microsoft\WinGet\Links\uv.exe` を絶対パスで実行する。
 - 依存関係の追加・削除には `uv add` / `uv remove` を使い、`pyproject.toml` と `uv.lock` を同期させる。
 - 開発実行:
 

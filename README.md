@@ -69,17 +69,23 @@ flowchart TD
     A["Windows Terminal"] --> B["act.cmd"]
     B --> C["uv"]
     C --> D["main.py"]
-    D --> E["Ollama / Qwen3"]
-    E --> F["ツール名と引数"]
-    F --> G["検索URLを生成"]
-    G --> H["Chromeで開く"]
+    D --> E["local_actions.cli"]
+    E --> F["slm: Ollama / Qwen3"]
+    F --> G["ツール名と引数"]
+    G --> H["registry: 検証と実行"]
+    H --> I["actions: 登録済み操作"]
 ```
 
 各要素の役割は次のとおりです。
 
 | 要素 | 役割 |
 |---|---|
-| `main.py` | 自然文の受け取り、Ollamaの呼び出し、ツール実行 |
+| `main.py` | CLIを起動するエントリーポイント |
+| `local_actions/cli.py` | 入力、選択、実行、ログ保存の流れを制御 |
+| `local_actions/slm.py` | Ollama上のSLMを呼び出し、ツールと引数を選択 |
+| `local_actions/registry.py` | 許可リスト、引数検証、安全設定、ツール実行 |
+| `local_actions/actions.py` | URL生成やWindows操作などの登録対象関数 |
+| `local_actions/action_log.py` | JSON Lines形式の実行ログを保存 |
 | Ollama | ローカルモデルの実行基盤 |
 | `qwen3:1.7b` | 日本語の指示からツールと引数を選択 |
 | `uv` | Python、仮想環境、依存ライブラリの管理 |
@@ -156,13 +162,20 @@ uv init --app
 uv add ollama
 ```
 
-これにより、主に次のファイルとフォルダが作成されます。
+現在の主なファイルとフォルダは次のとおりです。
 
 ```text
 workspace/
 ├── .venv/
+├── local_actions/
+│   ├── action_log.py
+│   ├── actions.py
+│   ├── cli.py
+│   ├── registry.py
+│   └── slm.py
 ├── main.py
 ├── pyproject.toml
+├── test_main.py
 ├── uv.lock
 └── README.md
 ```
@@ -204,6 +217,26 @@ act ...
 ```powershell
 act --list
 ```
+
+通常の`act`実行は、入力、選択された操作、引数、実行状態、戻り値またはエラーを
+UTF-8のJSON Lines形式で次のファイルへ追記します。`--list`の表示は記録しません。
+
+```text
+OneDrive\
+└── Local Actions\
+    └── actions.jsonl
+```
+
+1行が1回の実行に対応するため、PowerShellでは次のように確認できます。
+
+```powershell
+Get-Content "$env:OneDrive\Local Actions\actions.jsonl" -Encoding utf8
+```
+
+保存先を一時的に変更する場合は、環境変数`LOCAL_ACTIONS_LOG_PATH`へファイルパスを
+指定します。ログを保存できなかった場合は標準エラーへ警告を表示しますが、
+操作自体の結果やエラーは変更しません。OneDriveへサインインしていない場合も
+ログは保存されず、同じ警告を表示します。
 
 ### 配置場所
 
@@ -446,7 +479,7 @@ uv run python -m unittest -v
 - 現在ページの保存はChromeとEdgeのみ対応し、ブラウザのUI変更によって取得できなくなる可能性がある
 - 複数のブラウザウィンドウがある場合、WindowsのZ順で最上位のChromeまたはEdgeを対象にする
 - ゴミ箱の完全削除以外には、モデルの誤判定に対する確認画面や訂正操作はない
-- 実行ログと修正履歴はまだ保存していない
+- 修正履歴はまだ保存していない
 - Ollamaが停止している場合の案内は未実装
 - モデル出力が想定外だった場合のエラー処理は最低限
 - 検索やページ表示などの安全な操作は確認なしで実行される
@@ -463,13 +496,12 @@ uv run python -m unittest -v
 
 ### MVP後
 
-1. 入力、選択されたツール、引数、実行結果をログへ保存
-2. 誤判定をユーザーが訂正できる仕組みを追加
-3. 修正前後のデータを学習形式へ変換
-4. ツールごとの評価用テストセットを作成
-5. Qwen3のサイズ・量子化別精度を比較
-6. FunctionGemmaを日本語の個人データでファインチューニング
-7. 学習済みモデルを量子化し、Ollamaから実行
+1. 誤判定をユーザーが訂正できる仕組みを追加
+2. 修正前後のデータを学習形式へ変換
+3. ツールごとの評価用テストセットを作成
+4. Qwen3のサイズ・量子化別精度を比較
+5. FunctionGemmaを日本語の個人データでファインチューニング
+6. 学習済みモデルを量子化し、Ollamaから実行
 
 ## セキュリティ上の注意
 
