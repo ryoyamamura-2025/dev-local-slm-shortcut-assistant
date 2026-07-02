@@ -151,6 +151,23 @@ class OneDriveNoteTests(unittest.TestCase):
         self.assertIn(str(notes_path), result)
 
 
+class CalendarTaskTests(unittest.TestCase):
+    def test_dummy_calendar_task_accepts_empty_body(self) -> None:
+        result = main.create_calendar_task("田中さんに返信")
+
+        self.assertIn("[ダミー]", result)
+        self.assertIn("件名: 田中さんに返信", result)
+        self.assertIn("本文: 0文字", result)
+
+    def test_dummy_calendar_task_accepts_body(self) -> None:
+        body = "https://teams.example/message/123"
+
+        result = main.create_calendar_task("田中さんに返信", body)
+
+        self.assertIn(f"本文: {len(body)}文字", result)
+        self.assertNotIn(body, result)
+
+
 class WindowsActionTests(unittest.TestCase):
     @patch("local_actions.actions.os.startfile")
     def test_open_folder_opens_downloads_folder(
@@ -289,16 +306,138 @@ class WindowsActionTests(unittest.TestCase):
 
 class SelectActionTests(unittest.TestCase):
     @patch("local_actions.slm.chat")
-    def test_single_action_mode_rejects_multiple_tool_calls(
+    def test_select_actions_preserves_structured_step_order(
         self,
         chat: Mock,
     ) -> None:
         chat.return_value = Mock(
-            message=Mock(tool_calls=[Mock(), Mock()]),
+            message=Mock(
+                content=json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "action": "get_clipboard_text",
+                                "arguments": {},
+                            },
+                            {
+                                "action": "create_calendar_task",
+                                "arguments": {"title": "田中さんに返信"},
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            ),
         )
 
-        with self.assertRaisesRegex(SystemExit, "操作を1つだけ"):
-            slm.select_action("複数の操作")
+        self.assertEqual(
+            slm.select_actions("クリップボードの内容と一緒に登録"),
+            [
+                registry.PlannedAction("get_clipboard_text", {}),
+                registry.PlannedAction(
+                    "create_calendar_task",
+                    {"title": "田中さんに返信"},
+                ),
+            ],
+        )
+
+    def test_plan_schema_excludes_pipeline_supplied_argument(self) -> None:
+        schema = slm.build_action_plan_schema()
+        step_schemas = schema["properties"]["steps"]["items"]["oneOf"]
+        calendar_schema = next(
+            step
+            for step in step_schemas
+            if step["properties"]["action"]["const"]
+            == "create_calendar_task"
+        )
+        argument_properties = calendar_schema["properties"]["arguments"][
+            "properties"
+        ]
+
+        self.assertIn("title", argument_properties)
+        self.assertNotIn("body", argument_properties)
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_workflow_injects_previous_result_into_registered_argument(
+        self,
+    ) -> None:
+        calls = Mock()
+
+        def clipboard() -> str:
+            calls("clipboard")
+            return "https://teams.example/message/123"
+
+        def calendar(title: str, body: str = "") -> str:
+            calls("calendar", title=title, body=body)
+            return "[ダミー] 登録しました。"
+
+        plan = [
+            registry.PlannedAction("get_clipboard_text", {}),
+            registry.PlannedAction(
+                "create_calendar_task",
+                {"title": "田中さんに返信"},
+            ),
+        ]
+
+        with (
+            patch.dict(
+                registry.actions,
+                {
+                    "get_clipboard_text": registry.Action(clipboard),
+                    "create_calendar_task": registry.Action(
+                        calendar,
+                        accepts_previous_as="body",
+                    ),
+                },
+            ),
+            patch("local_actions.registry.print") as print_function,
+        ):
+            result = registry.execute_workflow(plan)
+
+        self.assertEqual(calls.call_args_list[0].args, ("clipboard",))
+        self.assertEqual(calls.call_args_list[1].args, ("calendar",))
+        self.assertEqual(
+            calls.call_args_list[1].kwargs,
+            {
+                "title": "田中さんに返信",
+                "body": "https://teams.example/message/123",
+            },
+        )
+        print_function.assert_called_once_with("[ダミー] 登録しました。")
+        self.assertEqual(result.result, "[ダミー] 登録しました。")
+
+    def test_workflow_validates_all_steps_before_execution(self) -> None:
+        clipboard = Mock(return_value="機密情報")
+        plan = [
+            registry.PlannedAction("get_clipboard_text", {}),
+            registry.PlannedAction("google_search", {"query": "test"}),
+        ]
+
+        with (
+            patch.dict(
+                registry.actions,
+                {"get_clipboard_text": registry.Action(clipboard)},
+            ),
+            self.assertRaisesRegex(ValueError, "受け取れません"),
+        ):
+            registry.execute_workflow(plan)
+
+        clipboard.assert_not_called()
+
+    def test_calendar_task_body_cannot_conflict_with_previous_result(
+        self,
+    ) -> None:
+        plan = [
+            registry.PlannedAction("get_clipboard_text", {}),
+            registry.PlannedAction(
+                "create_calendar_task",
+                {"title": "返信", "body": "モデルが生成した本文"},
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "競合"):
+            registry.execute_workflow(plan)
 
 
 class CommandLineOptionTests(unittest.TestCase):
@@ -312,17 +451,17 @@ class CommandLineOptionTests(unittest.TestCase):
         self.assertIn("Googleで検索する。", result)
         self.assertIn("empty_recycle_bin() [実行前に確認]", result)
 
-    @patch("local_actions.cli.select_action")
+    @patch("local_actions.cli.select_actions")
     @patch("local_actions.cli.print")
     def test_list_option_does_not_call_ollama(
         self,
         print_function: Mock,
-        select_action: Mock,
+        select_actions: Mock,
     ) -> None:
         with patch("local_actions.cli.sys.argv", ["main.py", "--list"]):
             cli.main()
 
-        select_action.assert_not_called()
+        select_actions.assert_not_called()
         print_function.assert_called_once_with(registry.format_action_list())
 
 
@@ -373,17 +512,19 @@ class ActionLogTests(unittest.TestCase):
                 onedrive_directory / "actions.jsonl",
             )
 
-    @patch("local_actions.cli.execute_action")
-    @patch("local_actions.cli.select_action")
+    @patch("local_actions.cli.execute_workflow")
+    @patch("local_actions.cli.select_actions")
     @patch("local_actions.cli.try_write_action_log")
     def test_main_records_success(
         self,
         write_log: Mock,
-        select_action: Mock,
-        execute_action: Mock,
+        select_actions: Mock,
+        execute_workflow: Mock,
     ) -> None:
-        select_action.return_value = ("google_search", {"query": "生成AI"})
-        execute_action.return_value = registry.ActionExecutionResult(
+        select_actions.return_value = [
+            registry.PlannedAction("google_search", {"query": "生成AI"})
+        ]
+        execute_workflow.return_value = registry.ActionExecutionResult(
             "succeeded",
             "https://www.google.com/search?q=生成AI",
         )
@@ -400,7 +541,7 @@ class ActionLogTests(unittest.TestCase):
         )
 
     @patch(
-        "local_actions.cli.select_action",
+        "local_actions.cli.select_actions",
         side_effect=RuntimeError("Ollama停止"),
     )
     @patch("local_actions.cli.try_write_action_log")

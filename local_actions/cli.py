@@ -1,14 +1,12 @@
 import json
 import sys
-from typing import Any
 
 from local_actions.action_log import try_write_action_log
 from local_actions.registry import (
-    execute_action,
+    execute_workflow,
     format_action_list,
-    normalize_action_arguments,
 )
-from local_actions.slm import select_action
+from local_actions.slm import select_actions
 
 
 def main() -> None:
@@ -19,27 +17,37 @@ def main() -> None:
         return
 
     request = " ".join(arguments).strip() or input("指示> ").strip()
-    name: str | None = None
-    action_arguments: dict[str, Any] = {}
+    operation: str | None = None
+    log_arguments: dict[str, object] = {}
     try:
-        name, action_arguments = select_action(request)
-        action_arguments = normalize_action_arguments(name, action_arguments)
-        selection = {"operation": name, **action_arguments}
+        plan = select_actions(request)
+        selection = {
+            "steps": [
+                {"operation": step.name, **step.arguments}
+                for step in plan
+            ]
+        }
         print(json.dumps(selection, ensure_ascii=False, indent=2))
 
-        execution = execute_action(name, action_arguments)
+        if len(plan) == 1:
+            operation = plan[0].name
+            log_arguments = dict(plan[0].arguments)
+        else:
+            operation = "workflow"
+            log_arguments = {"steps": selection["steps"]}
+        execution = execute_workflow(plan)
         try_write_action_log(
             request,
-            name,
-            action_arguments,
+            operation,
+            log_arguments,
             execution.status,
             result=execution.result,
         )
     except (Exception, SystemExit) as error:
         try_write_action_log(
             request,
-            name,
-            action_arguments,
+            operation,
+            log_arguments,
             "failed",
             error=f"{type(error).__name__}: {error}",
         )

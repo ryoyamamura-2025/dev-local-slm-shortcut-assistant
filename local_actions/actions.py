@@ -412,6 +412,27 @@ def get_clipboard_text() -> str:
     return text
 
 
+def create_calendar_task(title: str, body: str = "") -> str:
+    """指定された件名と本文でカレンダータスクを作成する（現在はダミー）。
+
+    Args:
+        title: カレンダーへ登録するタスク名。
+        body: タスク本文。省略した場合は空にする。
+    """
+    normalized_title = title.strip()
+    if not normalized_title:
+        raise ValueError("タスク名が空です。")
+
+    return "\n".join(
+        [
+            "[ダミー] カレンダータスクを登録します。",
+            f"件名: {normalized_title}",
+            f"本文: {len(body)}文字",
+            "ICSファイルの作成とOutlookへの登録はまだ行いません。",
+        ]
+    )
+
+
 def format_text_note(text: str) -> str:
     """テキストをMarkdownのリスト項目へ変換する。
 

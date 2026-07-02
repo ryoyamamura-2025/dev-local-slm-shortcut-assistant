@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from local_actions.actions import (
     copy_text,
+    create_calendar_task,
     create_text_note,
     empty_recycle_bin,
     get_clipboard_text,
@@ -29,6 +30,15 @@ class Action:
     function: Callable[..., str | None]
     open_result_in_browser: bool = False
     confirmation_message: str | None = None
+    accepts_previous_as: str | None = None
+
+
+@dataclass(frozen=True)
+class PlannedAction:
+    """SLMが選択した登録済み操作と自然文由来の引数を保持する。"""
+
+    name: str
+    arguments: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,7 @@ actions = {
         Action(copy_text),
         Action(create_text_note),
         Action(get_clipboard_text),
+        Action(create_calendar_task, accepts_previous_as="body"),
         Action(show_system_info),
         Action(lock_pc),
         Action(save_current_page),
@@ -144,6 +155,7 @@ def execute_action(
     arguments: dict[str, Any],
     input_function: Callable[[str], str] = input,
     browser_opener: Callable[[str], Any] = webbrowser.open_new_tab,
+    display_result: bool = True,
 ) -> ActionExecutionResult:
     """許可リストの操作を安全設定に従って実行する。
 
@@ -152,6 +164,7 @@ def execute_action(
         arguments: モデルが抽出したツール引数。
         input_function: 危険操作の確認入力に使う関数。
         browser_opener: URLを開くための関数。
+        display_result: 戻り値を標準出力へ表示するか。
     """
     action = actions.get(name)
     if action is None:
@@ -169,8 +182,79 @@ def execute_action(
     result = action.function(**arguments)
     if action.open_result_in_browser and result:
         browser_opener(result)
-    elif result:
+    elif result and display_result:
         print(result)
-    else:
+    elif not result and display_result:
         print("この操作はまだ未実装です。")
     return ActionExecutionResult("succeeded", result)
+
+
+def execute_workflow(
+    plan: list[PlannedAction],
+    input_function: Callable[[str], str] = input,
+    browser_opener: Callable[[str], Any] = webbrowser.open_new_tab,
+) -> ActionExecutionResult:
+    """最大3個の登録済み操作を直列実行し、直前の戻り値を引き継ぐ。
+
+    Args:
+        plan: SLMが選択した順序付きの操作。
+        input_function: 危険操作の確認入力に使う関数。
+        browser_opener: URLを開くための関数。
+    """
+    if not 1 <= len(plan) <= 3:
+        raise ValueError("ワークフローは1個以上3個以下の操作にしてください。")
+
+    for index, step in enumerate(plan):
+        action = actions.get(step.name)
+        if action is None:
+            raise ValueError(f"未登録の操作です: {step.name}")
+
+        validation_arguments = dict(step.arguments)
+        if index > 0:
+            parameter = action.accepts_previous_as
+            if parameter is None:
+                raise ValueError(
+                    f"{step.name}は直前の操作結果を受け取れません。"
+                )
+            if parameter in validation_arguments:
+                raise ValueError(
+                    f"{step.name}の{parameter}は直前の操作結果と競合します。"
+                )
+            validation_arguments[parameter] = ""
+        normalize_action_arguments(step.name, validation_arguments)
+
+    previous_result: str | None = None
+    final_execution: ActionExecutionResult | None = None
+
+    for index, step in enumerate(plan):
+        action = actions[step.name]
+
+        arguments = dict(step.arguments)
+        if index > 0:
+            parameter = action.accepts_previous_as
+            if parameter is None:
+                raise ValueError(
+                    f"{step.name}は直前の操作結果を受け取れません。"
+                )
+            if parameter in arguments:
+                raise ValueError(
+                    f"{step.name}の{parameter}は直前の操作結果と競合します。"
+                )
+            if previous_result is None:
+                raise ValueError("直前の操作に引き継げる戻り値がありません。")
+            arguments[parameter] = previous_result
+
+        final_execution = execute_action(
+            step.name,
+            arguments,
+            input_function=input_function,
+            browser_opener=browser_opener,
+            display_result=index == len(plan) - 1,
+        )
+        if final_execution.status == "cancelled":
+            return final_execution
+        previous_result = final_execution.result
+
+    if final_execution is None:
+        raise RuntimeError("ワークフローを実行できませんでした。")
+    return final_execution
