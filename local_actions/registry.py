@@ -216,11 +216,7 @@ def execute_workflow(
                 raise ValueError(
                     f"{step.name}は直前の操作結果を受け取れません。"
                 )
-            if parameter in validation_arguments:
-                raise ValueError(
-                    f"{step.name}の{parameter}は直前の操作結果と競合します。"
-                )
-            validation_arguments[parameter] = ""
+            validation_arguments.setdefault(parameter, "")
         normalize_action_arguments(step.name, validation_arguments)
 
     previous_result: str | None = None
@@ -236,13 +232,13 @@ def execute_workflow(
                 raise ValueError(
                     f"{step.name}は直前の操作結果を受け取れません。"
                 )
-            if parameter in arguments:
-                raise ValueError(
-                    f"{step.name}の{parameter}は直前の操作結果と競合します。"
-                )
             if previous_result is None:
                 raise ValueError("直前の操作に引き継げる戻り値がありません。")
-            arguments[parameter] = previous_result
+            model_value = arguments.get(parameter) or ""
+            if model_value:
+                arguments[parameter] = f"{model_value}\n===\n{previous_result}"
+            else:
+                arguments[parameter] = previous_result
 
         final_execution = execute_action(
             step.name,

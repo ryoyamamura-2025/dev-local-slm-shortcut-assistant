@@ -2,6 +2,7 @@ import json
 import sys
 
 from local_actions.action_log import try_write_action_log
+from local_actions.actions import run_pending_cleanup
 from local_actions.registry import (
     execute_workflow,
     format_action_list,
@@ -16,6 +17,7 @@ def main() -> None:
         print(format_action_list())
         return
 
+    run_pending_cleanup()
     request = " ".join(arguments).strip() or input("指示> ").strip()
     operation: str | None = None
     log_arguments: dict[str, object] = {}

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-このファイルは、このリポジトリで作業する Codex とその他のコーディングエージェント向けの指示です。
+このファイルは、このリポジトリで作業するコーディングエージェント向けの指示です。
 
 ## プロジェクト概要
 
@@ -19,7 +19,7 @@
 
 - Windows と PowerShell を前提にする。
 - Python と依存関係は `uv` で管理する。通常は仮想環境を直接操作せず、`uv run ...` を使う。
-- Codex のシェルでは `uv` が `PATH` にない場合がある。`uv` が見つからなければ、`$env:USERPROFILE\AppData\Local\Microsoft\WinGet\Links\uv.exe` を絶対パスで実行する。
+- コーディングエージェントのシェルでは `uv` が `PATH` にない場合がある。`uv` が見つからなければ、`$env:USERPROFILE\AppData\Local\Microsoft\WinGet\Links\uv.exe` を絶対パスで実行する。
 - 依存関係の追加・削除には `uv add` / `uv remove` を使い、`pyproject.toml` と `uv.lock` を同期させる。
 - 開発実行:
 
@@ -47,6 +47,7 @@
 - 既存の単純な構成を保ち、小規模な変更のために不要なフレームワークや抽象化を追加しない。
 - 公開関数には、目的と引数が分かる簡潔な型注釈と docstring を付ける。
 - ソース、ドキュメント、JSON 出力は UTF-8 とし、日本語が文字化けしないことを確認する。
+- ドキュメントには個人のフォルダ名やユーザー名を書かず、`%USERPROFILE%` などで一般化する。
 
 ## 変更時の確認
 

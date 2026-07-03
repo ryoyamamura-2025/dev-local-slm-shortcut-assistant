@@ -5,11 +5,17 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import uuid
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 from urllib.parse import urlencode
 
+
+CLEANUP_LIST_PATH = Path(__file__).with_name("pending_cleanup.txt")
 
 SettingsPage = Literal[
     "system",
@@ -27,6 +33,10 @@ SettingsPage = Literal[
 ]
 
 FolderName = Literal["onedrive", "downloads"]
+
+CalendarEntityType = Literal["タスク", "リマインダ"]
+
+CALENDAR_ENTITY_TYPES: tuple[str, ...] = get_args(CalendarEntityType)
 
 SETTINGS_PAGES: dict[str, tuple[str, str]] = {
     "system": ("システム情報", "ms-settings:about"),
@@ -412,25 +422,160 @@ def get_clipboard_text() -> str:
     return text
 
 
-def create_calendar_task(title: str, body: str = "") -> str:
-    """指定された件名と本文でカレンダータスクを作成する（現在はダミー）。
+def escape_ics_text(text: str) -> str:
+    """ICSのテキスト値をRFC 5545に従ってエスケープする。
 
     Args:
-        title: カレンダーへ登録するタスク名。
-        body: タスク本文。省略した場合は空にする。
+        text: SUMMARYやDESCRIPTIONへ埋め込むテキスト。
     """
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def format_calendar_ics(
+    subject: str,
+    start_time: str,
+    body: str,
+    uid: str,
+    dtstamp: str,
+) -> str:
+    """予定1件分のICS本文を組み立てる（副作用なし）。
+
+    Args:
+        subject: 予定の件名。
+        start_time: 開始日時（ISO 8601形式、例: 2026-07-01T14:00:00）。
+        body: 予定の本文。空文字の場合はDESCRIPTIONを付けない。
+        uid: 予定を一意に識別するUID。
+        dtstamp: 生成時刻（UTC、YYYYMMDDTHHMMSSZ形式）。
+    """
+    start_dt = datetime.fromisoformat(start_time)
+    end_dt = start_dt + timedelta(minutes=15)
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//dev-slm-shortcut//JP",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}",
+        f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}",
+        f"SUMMARY:{escape_ics_text(subject)}",
+    ]
+    if body:
+        lines.append(f"DESCRIPTION:{escape_ics_text(body)}")
+    lines += [
+        "BEGIN:VALARM",
+        "TRIGGER:PT0S",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Reminder",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+        "",
+    ]
+    return "\r\n".join(lines)
+
+
+def try_delete_ics(path: Path, attempts: int = 3, delay: float = 2.0) -> bool:
+    """カレンダーアプリが読み込む間、数回リトライして一時ICSを削除する。
+
+    Args:
+        path: 削除するICSファイル。
+        attempts: 試行回数。
+        delay: 試行間隔（秒）。
+    """
+    for _ in range(attempts):
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            time.sleep(delay)
+    return False
+
+
+def register_pending_cleanup(path: Path) -> None:
+    """削除できなかったICSを次回起動時の掃除対象として記録する。
+
+    Args:
+        path: 後で削除するICSファイル。
+    """
+    with CLEANUP_LIST_PATH.open("a", encoding="utf-8") as cleanup_list:
+        cleanup_list.write(str(path) + "\n")
+
+
+def run_pending_cleanup() -> None:
+    """前回削除できなかったICS一時ファイルをまとめて削除する。"""
+    if not CLEANUP_LIST_PATH.exists():
+        return
+
+    remaining = []
+    for line in CLEANUP_LIST_PATH.read_text(encoding="utf-8").splitlines():
+        path = Path(line.strip())
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            remaining.append(line)
+
+    if remaining:
+        CLEANUP_LIST_PATH.write_text(
+            "\n".join(remaining) + "\n", encoding="utf-8"
+        )
+    else:
+        CLEANUP_LIST_PATH.unlink(missing_ok=True)
+
+
+def create_calendar_task(
+    start_time: str,
+    entity_type: CalendarEntityType,
+    title: str,
+    body: str = "",
+) -> str:
+    """カレンダーの予定（タスク/リマインダ）をICSで作り、確認画面を開く。
+
+    Args:
+        start_time: 開始日時（ISO 8601形式、例: 2026-07-01T14:00:00）。
+        entity_type: 予定の種別。タスクまたはリマインダのいずれか。
+        title: 予定のタイトル。
+        body: 予定の本文。依頼文で指定された本文、またはワークフローで
+            直前の操作結果が渡る。両方ある場合は結合済みの文字列が渡る。
+    """
+    if sys.platform != "win32":
+        raise OSError("カレンダー登録はWindowsでのみ利用できます。")
+
     normalized_title = title.strip()
     if not normalized_title:
         raise ValueError("タスク名が空です。")
+    if entity_type not in CALENDAR_ENTITY_TYPES:
+        allowed = ", ".join(CALENDAR_ENTITY_TYPES)
+        raise ValueError(f"未対応の種別です: {entity_type}（許可値: {allowed}）")
 
-    return "\n".join(
-        [
-            "[ダミー] カレンダータスクを登録します。",
-            f"件名: {normalized_title}",
-            f"本文: {len(body)}文字",
-            "ICSファイルの作成とOutlookへの登録はまだ行いません。",
-        ]
-    )
+    subject = f"【{entity_type}】{normalized_title}"
+    uid = f"{uuid.uuid4()}@dev-slm-shortcut"
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ics_content = format_calendar_ics(subject, start_time, body, uid, dtstamp)
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".ics", delete=False, mode="wb"
+    ) as ics_file:
+        ics_file.write(ics_content.encode("utf-8"))
+        temp_path = Path(ics_file.name)
+
+    os.startfile(temp_path)
+    time.sleep(5)
+
+    if not try_delete_ics(temp_path):
+        register_pending_cleanup(temp_path)
+
+    return f"カレンダーの確認画面を開きました: {subject}"
 
 
 def format_text_note(text: str) -> str:

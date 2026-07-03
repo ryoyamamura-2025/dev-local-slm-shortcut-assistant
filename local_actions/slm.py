@@ -1,10 +1,40 @@
 import inspect
 import json
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, get_args, get_origin
 
 from ollama import chat
 
 from local_actions.registry import PlannedAction, actions
+
+
+WEEKDAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def next_business_day(from_date: date) -> date:
+    """指定日の翌営業日（土日を除く）を返す。
+
+    Args:
+        from_date: 起点となる日付。
+    """
+    next_day = from_date + timedelta(days=1)
+    while next_day.weekday() >= 5:  # 5=土, 6=日
+        next_day += timedelta(days=1)
+    return next_day
+
+
+def default_calendar_start(now: datetime) -> datetime:
+    """開始時刻が未指定の予定に使う既定の開始日時を返す。
+
+    Args:
+        now: 現在日時。
+    """
+    if now.hour < 12:
+        return now.replace(hour=12, minute=15, second=0, microsecond=0)
+    if now.hour < 18:
+        return now.replace(hour=15, minute=0, second=0, microsecond=0)
+    next_day = next_business_day(now.date())
+    return datetime(next_day.year, next_day.month, next_day.day, 8, 45)
 
 
 def parameter_schema(annotation: Any) -> dict[str, Any]:
@@ -26,8 +56,6 @@ def build_action_plan_schema() -> dict[str, Any]:
         properties: dict[str, Any] = {}
         required: list[str] = []
         for parameter in inspect.signature(action.function).parameters.values():
-            if parameter.name == action.accepts_previous_as:
-                continue
             properties[parameter.name] = parameter_schema(parameter.annotation)
             if parameter.default is inspect.Parameter.empty:
                 required.append(parameter.name)
@@ -71,11 +99,7 @@ def format_action_catalog() -> str:
     """登録済みActionの名前、SLM入力引数、説明を一覧化する。"""
     lines = ["利用できるAction:"]
     for name, action in actions.items():
-        parameters = [
-            parameter.name
-            for parameter in inspect.signature(action.function).parameters.values()
-            if parameter.name != action.accepts_previous_as
-        ]
+        parameters = list(inspect.signature(action.function).parameters)
         description = (
             inspect.getdoc(action.function) or "説明はありません。"
         ).splitlines()[0]
@@ -89,22 +113,36 @@ def select_actions(request: str) -> list[PlannedAction]:
     Args:
         request: ユーザーが入力した日本語の依頼。
     """
+    now = datetime.now()
+    default_start = default_calendar_start(now)
+
     response = chat(
         model="qwen3:1.7b",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    format_action_catalog()
+                    f"現在日時: {now.strftime('%Y-%m-%d %H:%M')}"
+                    f"（{WEEKDAY_NAMES[now.weekday()]}曜日）\n"
+                    + format_action_catalog()
                     + "\n\n"
                     "ユーザーの依頼に必要なActionを実行順に1個以上3個以下で"
                     "選んでください。単独で完了する依頼には1個だけ選んでください。"
                     "引数では依頼文の日本語を保持し、他言語へ翻訳しないでください。"
-                    "クリップボードの内容と一緒にカレンダータスクを登録する依頼では、"
-                    "最初にget_clipboard_text、次にcreate_calendar_taskを選んでください。"
-                    "create_calendar_taskのtitleにはタスク名だけを指定してください。"
-                    "bodyはPythonが直前の結果から渡すため、計画の入力対象外です。"
-                    "通常のカレンダータスク登録ではcreate_calendar_taskだけを選んでください。"
+                    "予定・タスク・リマインダの登録・追加・作成を求める依頼では"
+                    "create_calendar_taskを選んでください。"
+                    "entity_typeはタスクまたはリマインダから選び、"
+                    "titleには予定名だけを指定してください。"
+                    "start_timeはISO 8601形式（例: 2026-07-01T14:00:00）で指定し、"
+                    "開始時刻が明示されていない場合は"
+                    f"{default_start.strftime('%Y-%m-%dT%H:%M:00')}を使用してください。"
+                    "依頼文に本文が示されていればcreate_calendar_taskのbodyへ入れ、"
+                    "示されていなければbodyは空にしてください。"
+                    "クリップボードの内容を本文にする依頼では、"
+                    "最初にget_clipboard_text、次にcreate_calendar_taskを選び、"
+                    "bodyは空のままにしてください"
+                    "（Pythonが直前の結果を本文へ結合します）。"
+                    "通常のカレンダー登録ではcreate_calendar_taskだけを選んでください。"
                     "「今のページを保存して」「このページをメモして」のように、"
                     "現在表示しているページを保存またはメモする依頼では"
                     "必ずsave_current_pageを選んでください。"

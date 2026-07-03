@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -152,20 +153,68 @@ class OneDriveNoteTests(unittest.TestCase):
 
 
 class CalendarTaskTests(unittest.TestCase):
-    def test_dummy_calendar_task_accepts_empty_body(self) -> None:
-        result = main.create_calendar_task("田中さんに返信")
+    def test_format_calendar_ics_includes_escaped_body(self) -> None:
+        ics = main.format_calendar_ics(
+            "【タスク】田中さんに返信",
+            "2026-07-01T14:00:00",
+            "メモ; 重要, 明日",
+            "uid@dev-slm-shortcut",
+            "20260701T050000Z",
+        )
 
-        self.assertIn("[ダミー]", result)
-        self.assertIn("件名: 田中さんに返信", result)
-        self.assertIn("本文: 0文字", result)
+        self.assertIn("SUMMARY:【タスク】田中さんに返信", ics)
+        self.assertIn("DTSTART:20260701T140000", ics)
+        self.assertIn("DTEND:20260701T141500", ics)
+        self.assertIn(r"DESCRIPTION:メモ\; 重要\, 明日", ics)
 
-    def test_dummy_calendar_task_accepts_body(self) -> None:
-        body = "https://teams.example/message/123"
+    def test_format_calendar_ics_omits_empty_description(self) -> None:
+        ics = main.format_calendar_ics(
+            "【リマインダ】水を飲む",
+            "2026-07-01T14:00:00",
+            "",
+            "uid@dev-slm-shortcut",
+            "20260701T050000Z",
+        )
 
-        result = main.create_calendar_task("田中さんに返信", body)
+        event = ics.split("BEGIN:VALARM")[0]
+        self.assertNotIn("DESCRIPTION:", event)
 
-        self.assertIn(f"本文: {len(body)}文字", result)
-        self.assertNotIn(body, result)
+    @patch("local_actions.actions.time.sleep")
+    @patch("local_actions.actions.os.startfile")
+    def test_create_calendar_task_opens_and_cleans_up(
+        self,
+        startfile: Mock,
+        sleep: Mock,
+    ) -> None:
+        with patch("local_actions.actions.sys.platform", "win32"):
+            result = main.create_calendar_task(
+                "2026-07-01T14:00:00",
+                "タスク",
+                "田中さんに返信",
+            )
+
+        opened_path = Path(startfile.call_args.args[0])
+        self.assertEqual(opened_path.suffix, ".ics")
+        self.assertFalse(opened_path.exists())
+        self.assertIn("【タスク】田中さんに返信", result)
+
+    def test_create_calendar_task_rejects_empty_title(self) -> None:
+        with (
+            patch("local_actions.actions.sys.platform", "win32"),
+            self.assertRaisesRegex(ValueError, "タスク名が空"),
+        ):
+            main.create_calendar_task("2026-07-01T14:00:00", "タスク", "  ")
+
+    def test_create_calendar_task_rejects_unknown_entity_type(self) -> None:
+        with (
+            patch("local_actions.actions.sys.platform", "win32"),
+            self.assertRaisesRegex(ValueError, "未対応の種別"),
+        ):
+            main.create_calendar_task(
+                "2026-07-01T14:00:00",
+                "予定",
+                "田中さんに返信",
+            )
 
 
 class WindowsActionTests(unittest.TestCase):
@@ -321,7 +370,11 @@ class SelectActionTests(unittest.TestCase):
                             },
                             {
                                 "action": "create_calendar_task",
-                                "arguments": {"title": "田中さんに返信"},
+                                "arguments": {
+                                    "start_time": "2026-07-03T15:00:00",
+                                    "entity_type": "タスク",
+                                    "title": "田中さんに返信",
+                                },
                             },
                         ]
                     },
@@ -336,12 +389,16 @@ class SelectActionTests(unittest.TestCase):
                 registry.PlannedAction("get_clipboard_text", {}),
                 registry.PlannedAction(
                     "create_calendar_task",
-                    {"title": "田中さんに返信"},
+                    {
+                        "start_time": "2026-07-03T15:00:00",
+                        "entity_type": "タスク",
+                        "title": "田中さんに返信",
+                    },
                 ),
             ],
         )
 
-    def test_plan_schema_excludes_pipeline_supplied_argument(self) -> None:
+    def test_plan_schema_exposes_body_as_optional_argument(self) -> None:
         schema = slm.build_action_plan_schema()
         step_schemas = schema["properties"]["steps"]["items"]["oneOf"]
         calendar_schema = next(
@@ -350,12 +407,33 @@ class SelectActionTests(unittest.TestCase):
             if step["properties"]["action"]["const"]
             == "create_calendar_task"
         )
-        argument_properties = calendar_schema["properties"]["arguments"][
-            "properties"
-        ]
+        arguments_schema = calendar_schema["properties"]["arguments"]
+        argument_properties = arguments_schema["properties"]
 
         self.assertIn("title", argument_properties)
-        self.assertNotIn("body", argument_properties)
+        self.assertIn("body", argument_properties)
+        self.assertNotIn("body", arguments_schema.get("required", []))
+
+
+class CalendarScheduleTests(unittest.TestCase):
+    def test_default_start_uses_lunch_slot_in_morning(self) -> None:
+        self.assertEqual(
+            slm.default_calendar_start(datetime(2026, 7, 3, 9, 0)),
+            datetime(2026, 7, 3, 12, 15),
+        )
+
+    def test_default_start_uses_afternoon_slot_before_evening(self) -> None:
+        self.assertEqual(
+            slm.default_calendar_start(datetime(2026, 7, 3, 13, 30)),
+            datetime(2026, 7, 3, 15, 0),
+        )
+
+    def test_default_start_moves_to_next_business_day_at_night(self) -> None:
+        # 2026-07-03は金曜日のため、翌営業日は月曜の2026-07-06。
+        self.assertEqual(
+            slm.default_calendar_start(datetime(2026, 7, 3, 20, 0)),
+            datetime(2026, 7, 6, 8, 45),
+        )
 
 
 class WorkflowTests(unittest.TestCase):
@@ -425,19 +503,46 @@ class WorkflowTests(unittest.TestCase):
 
         clipboard.assert_not_called()
 
-    def test_calendar_task_body_cannot_conflict_with_previous_result(
-        self,
-    ) -> None:
+    def test_workflow_merges_model_body_with_previous_result(self) -> None:
+        calls = Mock()
+
+        def clipboard() -> str:
+            return "https://teams.example/message/123"
+
+        def calendar(title: str, body: str = "") -> str:
+            calls(title=title, body=body)
+            return "登録しました。"
+
         plan = [
             registry.PlannedAction("get_clipboard_text", {}),
             registry.PlannedAction(
                 "create_calendar_task",
-                {"title": "返信", "body": "モデルが生成した本文"},
+                {"title": "返信", "body": "モデルが書いた本文"},
             ),
         ]
 
-        with self.assertRaisesRegex(ValueError, "競合"):
+        with (
+            patch.dict(
+                registry.actions,
+                {
+                    "get_clipboard_text": registry.Action(clipboard),
+                    "create_calendar_task": registry.Action(
+                        calendar,
+                        accepts_previous_as="body",
+                    ),
+                },
+            ),
+            patch("local_actions.registry.print"),
+        ):
             registry.execute_workflow(plan)
+
+        self.assertEqual(
+            calls.call_args.kwargs,
+            {
+                "title": "返信",
+                "body": "モデルが書いた本文\n===\nhttps://teams.example/message/123",
+            },
+        )
 
 
 class CommandLineOptionTests(unittest.TestCase):
