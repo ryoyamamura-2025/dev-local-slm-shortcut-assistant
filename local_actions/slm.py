@@ -147,6 +147,10 @@ def select_actions(request: str) -> list[PlannedAction]:
                     "現在表示しているページを保存またはメモする依頼では"
                     "必ずsave_current_pageを選んでください。"
                     "指定された文章をメモする依頼はcreate_text_noteを選んでください。"
+                    "クリップボードの内容をメモする依頼では、"
+                    "最初にget_clipboard_text、次にcreate_text_noteを選び、"
+                    "textは空のままにしてください"
+                    "（Pythonが直前の結果をtextへ渡します）。"
                     "文章をクリップボードへコピーする依頼はcopy_text、"
                     "クリップボードの内容を表示する依頼はget_clipboard_textを"
                     "選んでください。"
@@ -169,6 +173,9 @@ def select_actions(request: str) -> list[PlannedAction]:
         think=False,
         options={"temperature": 0},
     )
+
+    if response.message.thinking:
+        print(response.message.thinking)
 
     try:
         payload = json.loads(response.message.content)

@@ -64,7 +64,7 @@ actions = {
         Action(open_folder),
         Action(open_settings),
         Action(copy_text),
-        Action(create_text_note),
+        Action(create_text_note, accepts_previous_as="text"),
         Action(get_clipboard_text),
         Action(create_calendar_task, accepts_previous_as="body"),
         Action(show_system_info),

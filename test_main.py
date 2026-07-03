@@ -361,6 +361,7 @@ class SelectActionTests(unittest.TestCase):
     ) -> None:
         chat.return_value = Mock(
             message=Mock(
+                thinking="登録済みActionと引数を検討しました。",
                 content=json.dumps(
                     {
                         "steps": [
@@ -383,20 +384,24 @@ class SelectActionTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(
-            slm.select_actions("クリップボードの内容と一緒に登録"),
-            [
-                registry.PlannedAction("get_clipboard_text", {}),
-                registry.PlannedAction(
-                    "create_calendar_task",
-                    {
-                        "start_time": "2026-07-03T15:00:00",
-                        "entity_type": "タスク",
-                        "title": "田中さんに返信",
-                    },
-                ),
-            ],
-        )
+        with patch("builtins.print") as output:
+            self.assertEqual(
+                slm.select_actions("クリップボードの内容と一緒に登録"),
+                [
+                    registry.PlannedAction("get_clipboard_text", {}),
+                    registry.PlannedAction(
+                        "create_calendar_task",
+                        {
+                            "start_time": "2026-07-03T15:00:00",
+                            "entity_type": "タスク",
+                            "title": "田中さんに返信",
+                        },
+                    ),
+                ],
+            )
+
+        self.assertTrue(chat.call_args.kwargs["think"])
+        output.assert_called_once_with("登録済みActionと引数を検討しました。")
 
     def test_plan_schema_exposes_body_as_optional_argument(self) -> None:
         schema = slm.build_action_plan_schema()
@@ -437,6 +442,40 @@ class CalendarScheduleTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_workflow_injects_clipboard_result_into_text_note(self) -> None:
+        calls = Mock()
+        note_input = registry.actions["create_text_note"].accepts_previous_as
+        self.assertEqual(note_input, "text")
+
+        def clipboard() -> str:
+            return "クリップボードの実際の内容"
+
+        def create_note(text: str) -> str:
+            calls(text=text)
+            return "メモを保存しました。"
+
+        plan = [
+            registry.PlannedAction("get_clipboard_text", {}),
+            registry.PlannedAction("create_text_note", {}),
+        ]
+
+        with (
+            patch.dict(
+                registry.actions,
+                {
+                    "get_clipboard_text": registry.Action(clipboard),
+                    "create_text_note": registry.Action(
+                        create_note,
+                        accepts_previous_as=note_input,
+                    ),
+                },
+            ),
+            patch("local_actions.registry.print"),
+        ):
+            registry.execute_workflow(plan)
+
+        calls.assert_called_once_with(text="クリップボードの実際の内容")
+
     def test_workflow_injects_previous_result_into_registered_argument(
         self,
     ) -> None:
