@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Literal, get_args
 from urllib.parse import quote, urlencode
 
+from openpyxl import Workbook, load_workbook
+
 
 CLEANUP_LIST_PATH = Path(__file__).with_name("pending_cleanup.txt")
 WSL_VIRTUAL_DISK_PATH = Path(
@@ -52,10 +54,13 @@ SettingsPage = Literal[
 FolderName = Literal["onedrive", "downloads"]
 
 CalendarEntityType = Literal["タスク", "リマインダ"]
+CaptureKind = Literal["memo", "log"]
 XDestination = Literal["search", "home", "profile", "likes"]
 X_USERNAME_ENV_VAR = "LOCAL_ACTIONS_X_USERNAME"
 
 CALENDAR_ENTITY_TYPES: tuple[str, ...] = get_args(CalendarEntityType)
+CAPTURE_KINDS: tuple[str, ...] = get_args(CaptureKind)
+CAPTURE_HEADERS = ("timestamp", "kind", "title", "body")
 
 SETTINGS_PAGES: dict[str, tuple[str, str]] = {
     "system": ("システム情報", "ms-settings:about"),
@@ -335,9 +340,9 @@ def get_onedrive_directory() -> Path:
     )
 
 
-def get_saved_pages_path() -> Path:
-    """保存したページを書き込むOneDrive上のファイルパスを返す。"""
-    return get_onedrive_directory() / "saved_pages.md"
+def get_capture_path() -> Path:
+    """キャプチャを書き込むOneDrive上のExcelファイルを返す。"""
+    return get_onedrive_directory() / "inbox.xlsx"
 
 
 def get_downloads_directory() -> Path:
@@ -450,6 +455,50 @@ def get_clipboard_text() -> str:
     if not text:
         raise ValueError("クリップボードのテキストが空です。")
     return text
+
+
+def _normalize_title(title: str, label: str) -> str:
+    """必須タイトルから前後の空白を除去し、空ならエラーにする。"""
+    normalized_title = title.strip()
+    if not normalized_title:
+        raise ValueError(f"{label}が空です。")
+    return normalized_title
+
+
+def capture(kind: CaptureKind, title: str, body: str = "") -> str:
+    """メモまたはログをOneDrive上のExcel INBOXへ追記する。
+
+    Args:
+        kind: キャプチャの種別。memoまたはlog。
+        title: キャプチャのタイトル。
+        body: キャプチャの本文。依頼文で指定された本文、またはワークフローで
+            直前の操作結果が渡る。両方ある場合は結合済みの文字列が渡る。
+    """
+    normalized_title = _normalize_title(title, "タイトル")
+    if kind not in CAPTURE_KINDS:
+        allowed = ", ".join(CAPTURE_KINDS)
+        raise ValueError(
+            f"未対応のキャプチャ種別です: {kind}（許可値: {allowed}）"
+        )
+
+    capture_path = get_capture_path()
+    capture_path.parent.mkdir(parents=True, exist_ok=True)
+    if capture_path.exists():
+        workbook = load_workbook(capture_path)
+        worksheet = workbook.active
+    else:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "INBOX"
+        worksheet.append(CAPTURE_HEADERS)
+
+    try:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        worksheet.append((timestamp, kind, normalized_title, body))
+        workbook.save(capture_path)
+    finally:
+        workbook.close()
+    return f"Excel INBOXへ保存しました: {normalized_title}\n{capture_path}"
 
 
 def escape_ics_text(text: str) -> str:
@@ -581,9 +630,7 @@ def create_calendar_task(
     if sys.platform != "win32":
         raise OSError("カレンダー登録はWindowsでのみ利用できます。")
 
-    normalized_title = title.strip()
-    if not normalized_title:
-        raise ValueError("タスク名が空です。")
+    normalized_title = _normalize_title(title, "タスク名")
     if entity_type not in CALENDAR_ENTITY_TYPES:
         allowed = ", ".join(CALENDAR_ENTITY_TYPES)
         raise ValueError(f"未対応の種別です: {entity_type}（許可値: {allowed}）")
@@ -608,7 +655,7 @@ def create_calendar_task(
     return f"カレンダーの確認画面を開きました: {subject}"
 
 
-def get_current_page() -> tuple[str, str]:
+def get_current_page() -> str:
     """直近のChromeまたはEdgeウィンドウからタイトルとURLを取得する。"""
     if sys.platform != "win32":
         raise OSError("現在ページの取得はWindowsでのみ利用できます。")
@@ -650,48 +697,7 @@ def get_current_page() -> tuple[str, str]:
 
     if not title or not url:
         raise OSError("ブラウザから空のページ情報が返されました。")
-    return title, url
-
-
-def format_saved_page(title: str, url: str) -> str:
-    """ページ情報をMarkdownのリスト項目へ変換する。
-
-    Args:
-        title: 保存するページタイトル。
-        url: 保存するページURL。
-    """
-    safe_title = (
-        title.replace("\r", " ")
-        .replace("\n", " ")
-        .replace("\\", "\\\\")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-    )
-    safe_url = (
-        url.replace("\r", "")
-        .replace("\n", "")
-        .replace("<", "%3C")
-        .replace(">", "%3E")
-    )
-    return f"- [{safe_title}](<{safe_url}>)\n"
-
-
-def save_current_page() -> str:
-    """直近のChromeまたはEdgeのページをMarkdownメモへ保存する。"""
-    title, url = get_current_page()
-    saved_pages_path = get_saved_pages_path()
-    saved_pages_path.parent.mkdir(parents=True, exist_ok=True)
-    needs_heading = (
-        not saved_pages_path.exists()
-        or saved_pages_path.stat().st_size == 0
-    )
-
-    with saved_pages_path.open("a", encoding="utf-8", newline="\n") as memo:
-        if needs_heading:
-            memo.write("# Saved Pages\n\n")
-        memo.write(format_saved_page(title, url))
-
-    return f"ページを保存しました: {title}\n{saved_pages_path}"
+    return f"{title}\n{url}"
 
 
 def open_recycle_bin() -> str:

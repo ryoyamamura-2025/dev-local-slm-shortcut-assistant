@@ -5,6 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
+from openpyxl import load_workbook
+
 from local_actions import action_log
 from local_actions import actions as main
 from local_actions import cli, direct_commands, registry, slm
@@ -58,45 +60,34 @@ class UrlActionTests(unittest.TestCase):
             main.x_open("profile")
 
 
-class SaveCurrentPageTests(unittest.TestCase):
-    def test_format_saved_page_escapes_markdown(self) -> None:
-        self.assertEqual(
-            main.format_saved_page(
-                r"Example [page]",
-                "https://example.com/a>b",
-            ),
-            r"- [Example \[page\]](<https://example.com/a%3Eb>)" + "\n",
-        )
-
-    @patch("local_actions.actions.get_current_page")
-    def test_save_current_page_appends_utf8_markdown(
-        self,
-        get_current_page: Mock,
-    ) -> None:
-        get_current_page.return_value = (
-            "日本語のページ",
-            "https://example.com/日本語",
-        )
-
+class CaptureTests(unittest.TestCase):
+    def test_capture_creates_headers_and_appends_rows(self) -> None:
         with TemporaryDirectory() as directory:
-            memo_path = Path(directory) / "saved_pages.md"
+            capture_path = Path(directory) / "inbox.xlsx"
             with patch(
-                "local_actions.actions.get_saved_pages_path",
-                return_value=memo_path,
+                "local_actions.actions.get_capture_path",
+                return_value=capture_path,
             ):
-                result = main.save_current_page()
-                main.save_current_page()
+                result = main.capture("memo", " 日本語のメモ ", "本文")
+                main.capture("log", "作業記録")
 
-            self.assertEqual(
-                memo_path.read_text(encoding="utf-8"),
-                (
-                    "# Saved Pages\n\n"
-                    "- [日本語のページ](<https://example.com/日本語>)\n"
-                    "- [日本語のページ](<https://example.com/日本語>)\n"
-                ),
-            )
+            workbook = load_workbook(capture_path, read_only=True)
+            rows = list(workbook.active.iter_rows(values_only=True))
+            workbook.close()
 
-        self.assertIn("ページを保存しました", result)
+        self.assertEqual(rows[0], main.CAPTURE_HEADERS)
+        self.assertEqual(rows[1][1:], ("memo", "日本語のメモ", "本文"))
+        self.assertEqual(rows[2][1:], ("log", "作業記録", None))
+        self.assertIn("Excel INBOXへ保存しました", result)
+
+    def test_capture_rejects_empty_title_and_unknown_kind(self) -> None:
+        with self.assertRaisesRegex(ValueError, "タイトルが空"):
+            main.capture("memo", " ")
+        with self.assertRaisesRegex(ValueError, "未対応のキャプチャ種別"):
+            main.capture("other", "題名")
+
+
+class CurrentPageTests(unittest.TestCase):
 
     @patch("local_actions.actions.subprocess.run")
     def test_get_current_page_parses_ui_automation_result(
@@ -112,7 +103,7 @@ class SaveCurrentPageTests(unittest.TestCase):
         with patch("local_actions.actions.sys.platform", "win32"):
             self.assertEqual(
                 main.get_current_page(),
-                ("Example", "https://example.com"),
+                "Example\nhttps://example.com",
             )
 
         command = run.call_args.args[0]
@@ -432,6 +423,23 @@ class SelectActionTests(unittest.TestCase):
         self.assertIn("body", argument_properties)
         self.assertNotIn("body", arguments_schema.get("required", []))
 
+    def test_plan_schema_exposes_capture_kind_and_optional_body(self) -> None:
+        schema = slm.build_action_plan_schema()
+        step_schemas = schema["properties"]["steps"]["items"]["oneOf"]
+        capture_schema = next(
+            step
+            for step in step_schemas
+            if step["properties"]["action"]["const"] == "capture"
+        )
+        arguments_schema = capture_schema["properties"]["arguments"]
+
+        self.assertEqual(
+            arguments_schema["properties"]["kind"]["enum"],
+            ["memo", "log"],
+        )
+        self.assertIn("title", arguments_schema["required"])
+        self.assertNotIn("body", arguments_schema["required"])
+
 
 class CalendarScheduleTests(unittest.TestCase):
     def test_default_start_uses_lunch_slot_in_morning(self) -> None:
@@ -562,6 +570,57 @@ class WorkflowTests(unittest.TestCase):
             },
         )
 
+    def test_workflow_combines_passthrough_results_before_injection(
+        self,
+    ) -> None:
+        capture_call = Mock()
+
+        def clipboard() -> str:
+            return "クリップボード"
+
+        def current_page() -> str:
+            return "ページタイトル\nhttps://example.com"
+
+        def capture(title: str, body: str = "") -> str:
+            capture_call(title=title, body=body)
+            return "保存しました。"
+
+        plan = [
+            registry.PlannedAction("get_clipboard_text", {}),
+            registry.PlannedAction("get_current_page", {}),
+            registry.PlannedAction("capture", {"title": "資料"}),
+        ]
+
+        with (
+            patch.dict(
+                registry.actions,
+                {
+                    "get_clipboard_text": registry.Action(
+                        clipboard,
+                        passthrough=True,
+                    ),
+                    "get_current_page": registry.Action(
+                        current_page,
+                        passthrough=True,
+                    ),
+                    "capture": registry.Action(
+                        capture,
+                        accepts_previous_as="body",
+                    ),
+                },
+            ),
+            patch("local_actions.registry.print"),
+        ):
+            registry.execute_workflow(plan)
+
+        capture_call.assert_called_once_with(
+            title="資料",
+            body=(
+                "クリップボード\n===\n"
+                "ページタイトル\nhttps://example.com"
+            ),
+        )
+
 
 class CommandLineOptionTests(unittest.TestCase):
     def test_format_action_list_contains_registered_actions(self) -> None:
@@ -571,6 +630,9 @@ class CommandLineOptionTests(unittest.TestCase):
         self.assertIn("google_maps_search(query)", result)
         self.assertIn("x_open(destination, query)", result)
         self.assertIn("open_folder(folder)", result)
+        self.assertIn("get_current_page()", result)
+        self.assertIn("capture(kind, title, body)", result)
+        self.assertNotIn("save_current_page()", result)
         self.assertNotIn("google_search(query)", result)
         self.assertNotIn("empty_recycle_bin()", result)
 

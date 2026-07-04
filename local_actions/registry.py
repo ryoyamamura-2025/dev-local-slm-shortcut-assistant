@@ -5,13 +5,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from local_actions.actions import (
+    capture,
     copy_text,
     create_calendar_task,
     get_clipboard_text,
+    get_current_page,
     google_maps_search,
     lock_pc,
     open_folder,
-    save_current_page,
     x_open,
 )
 
@@ -24,6 +25,7 @@ class Action:
     open_result_in_browser: bool = False
     confirmation_message: str | None = None
     accepts_previous_as: str | None = None
+    passthrough: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,10 +55,11 @@ actions = {
         Action(x_open, open_result_in_browser=True),
         Action(open_folder),
         Action(copy_text),
-        Action(get_clipboard_text),
+        Action(get_clipboard_text, passthrough=True),
+        Action(get_current_page, passthrough=True),
+        Action(capture, accepts_previous_as="body"),
         Action(create_calendar_task, accepts_previous_as="body"),
         Action(lock_pc),
-        Action(save_current_page),
     ]
 }
 
@@ -192,11 +195,12 @@ def execute_workflow(
         validation_arguments = dict(step.arguments)
         if index > 0:
             parameter = action.accepts_previous_as
-            if parameter is None:
+            if parameter is None and not action.passthrough:
                 raise ValueError(
                     f"{step.name}は直前の操作結果を受け取れません。"
                 )
-            validation_arguments.setdefault(parameter, "")
+            if parameter is not None:
+                validation_arguments.setdefault(parameter, "")
         normalize_action_arguments(step.name, validation_arguments)
 
     previous_result: str | None = None
@@ -208,17 +212,20 @@ def execute_workflow(
         arguments = dict(step.arguments)
         if index > 0:
             parameter = action.accepts_previous_as
-            if parameter is None:
+            if parameter is None and not action.passthrough:
                 raise ValueError(
                     f"{step.name}は直前の操作結果を受け取れません。"
                 )
             if previous_result is None:
                 raise ValueError("直前の操作に引き継げる戻り値がありません。")
-            model_value = arguments.get(parameter) or ""
-            if model_value:
-                arguments[parameter] = f"{model_value}\n===\n{previous_result}"
-            else:
-                arguments[parameter] = previous_result
+            if parameter is not None:
+                model_value = arguments.get(parameter) or ""
+                if model_value:
+                    arguments[parameter] = (
+                        f"{model_value}\n===\n{previous_result}"
+                    )
+                else:
+                    arguments[parameter] = previous_result
 
         final_execution = execute_action(
             step.name,
@@ -229,7 +236,19 @@ def execute_workflow(
         )
         if final_execution.status == "cancelled":
             return final_execution
-        previous_result = final_execution.result
+        current_result = final_execution.result
+        if index > 0 and action.passthrough:
+            if current_result is None:
+                raise ValueError(
+                    f"{step.name}に引き継げる戻り値がありません。"
+                )
+            previous_result = f"{previous_result}\n===\n{current_result}"
+            final_execution = ActionExecutionResult(
+                "succeeded",
+                previous_result,
+            )
+        else:
+            previous_result = current_result
 
     if final_execution is None:
         raise RuntimeError("ワークフローを実行できませんでした。")
