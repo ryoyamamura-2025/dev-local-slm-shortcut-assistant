@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from local_actions import action_log
 from local_actions import actions as main
-from local_actions import cli, registry, slm
+from local_actions import cli, direct_commands, registry, slm
 
 
 class UrlActionTests(unittest.TestCase):
@@ -400,7 +400,7 @@ class SelectActionTests(unittest.TestCase):
                 ],
             )
 
-        self.assertTrue(chat.call_args.kwargs["think"])
+        self.assertFalse(chat.call_args.kwargs["think"])
         output.assert_called_once_with("登録済みActionと引数を検討しました。")
 
     def test_plan_schema_exposes_body_as_optional_argument(self) -> None:
@@ -606,7 +606,160 @@ class CommandLineOptionTests(unittest.TestCase):
             cli.main()
 
         select_actions.assert_not_called()
-        print_function.assert_called_once_with(registry.format_action_list())
+        listing = print_function.call_args.args[0]
+        self.assertIn(registry.format_action_list(), listing)
+        self.assertIn("tmp削除", listing)
+        self.assertIn("WSL圧縮", listing)
+
+
+class DirectCommandTests(unittest.TestCase):
+    def test_direct_command_aliases_use_exact_matching(self) -> None:
+        self.assertEqual(
+            direct_commands.match_direct_command("tmp削除").operation,
+            "clear_temp_files",
+        )
+        self.assertEqual(
+            direct_commands.match_direct_command("tmpdelete").operation,
+            "clear_temp_files",
+        )
+        self.assertEqual(
+            direct_commands.match_direct_command("WSL圧縮").operation,
+            "prune_docker_and_compact_wsl",
+        )
+        self.assertEqual(
+            direct_commands.match_direct_command("wslcomp").operation,
+            "prune_docker_and_compact_wsl",
+        )
+        self.assertEqual(
+            direct_commands.match_direct_command("ＷＳＬ圧縮"),
+            None,
+        )
+        self.assertIsNone(
+            direct_commands.match_direct_command("tmp削除して"),
+        )
+
+    @patch("local_actions.cli.select_actions")
+    @patch("local_actions.cli.execute_direct_command")
+    @patch("local_actions.cli.try_write_action_log")
+    def test_direct_command_does_not_call_ollama(
+        self,
+        write_log: Mock,
+        execute_direct: Mock,
+        select_actions: Mock,
+    ) -> None:
+        execute_direct.return_value = "一時フォルダを掃除しました。"
+
+        with (
+            patch("local_actions.cli.sys.argv", ["main.py", "tmp削除"]),
+            patch("local_actions.cli.print"),
+        ):
+            cli.main()
+
+        select_actions.assert_not_called()
+        execute_direct.assert_called_once()
+        write_log.assert_called_once_with(
+            "tmp削除",
+            "clear_temp_files",
+            {},
+            "succeeded",
+            result="一時フォルダを掃除しました。",
+        )
+
+    def test_clear_temp_files_skips_locked_entries(self) -> None:
+        with TemporaryDirectory() as directory:
+            temp_directory = Path(directory)
+            removable = temp_directory / "remove.txt"
+            locked = temp_directory / "locked.txt"
+            removable.write_text("remove", encoding="utf-8")
+            locked.write_text("locked", encoding="utf-8")
+            original_unlink = Path.unlink
+
+            def unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path == locked:
+                    raise PermissionError("使用中")
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                patch("local_actions.actions.sys.platform", "win32"),
+                patch.dict("local_actions.actions.os.environ", {"TMP": directory}),
+                patch("pathlib.Path.unlink", new=unlink),
+            ):
+                result = main.clear_temp_files()
+
+        self.assertIn("削除: 1件", result)
+        self.assertIn("スキップ: 1件", result)
+
+    @patch("local_actions.actions.subprocess.run")
+    def test_docker_prune_and_compact_wsl_use_fixed_commands(
+        self,
+        run: Mock,
+    ) -> None:
+        run.return_value = Mock(returncode=0, stdout="", stderr="")
+        written_script = ""
+        original_named_temp = main.tempfile.NamedTemporaryFile
+
+        def named_temp(*args: object, **kwargs: object):
+            nonlocal written_script
+            temporary = original_named_temp(*args, **kwargs)
+            original_write = temporary.write
+
+            def write(value: str) -> int:
+                nonlocal written_script
+                written_script = value
+                return original_write(value)
+
+            temporary.write = write
+            return temporary
+
+        with (
+            patch("local_actions.actions.sys.platform", "win32"),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch(
+                "local_actions.actions.tempfile.NamedTemporaryFile",
+                side_effect=named_temp,
+            ),
+        ):
+            result = main.prune_docker_and_compact_wsl()
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list[:3]],
+            [
+                [
+                    "wsl.exe",
+                    "--exec",
+                    "docker",
+                    "image",
+                    "prune",
+                    "--all",
+                    "--force",
+                ],
+                [
+                    "wsl.exe",
+                    "--exec",
+                    "docker",
+                    "volume",
+                    "prune",
+                    "--force",
+                ],
+                [
+                    "wsl.exe",
+                    "--exec",
+                    "docker",
+                    "builder",
+                    "prune",
+                    "--force",
+                ],
+            ],
+        )
+        self.assertEqual(run.call_args_list[3].args[0], ["wsl.exe", "--shutdown"])
+        self.assertIn(
+            f'select vdisk file="{main.WSL_VIRTUAL_DISK_PATH}"',
+            written_script,
+        )
+        self.assertIn("attach vdisk readonly", written_script)
+        self.assertIn("compact vdisk", written_script)
+        self.assertIn("detach vdisk", written_script)
+        self.assertIn(str(main.WSL_VIRTUAL_DISK_PATH), result)
 
 
 class ActionLogTests(unittest.TestCase):

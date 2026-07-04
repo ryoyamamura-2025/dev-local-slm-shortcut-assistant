@@ -3,6 +3,11 @@ import sys
 
 from local_actions.action_log import try_write_action_log
 from local_actions.actions import run_pending_cleanup
+from local_actions.direct_commands import (
+    execute_direct_command,
+    format_direct_command_list,
+    match_direct_command,
+)
 from local_actions.registry import (
     execute_workflow,
     format_action_list,
@@ -14,7 +19,7 @@ def main() -> None:
     """自然文から登録済み操作を選択し、安全設定に従って実行する。"""
     arguments = sys.argv[1:]
     if len(arguments) == 1 and arguments[0] in {"--list", "-l"}:
-        print(format_action_list())
+        print(f"{format_action_list()}\n\n{format_direct_command_list()}")
         return
 
     run_pending_cleanup()
@@ -22,6 +27,26 @@ def main() -> None:
     operation: str | None = None
     log_arguments: dict[str, object] = {}
     try:
+        direct_command = match_direct_command(request)
+        if direct_command is not None:
+            operation = direct_command.operation
+            print(
+                json.dumps(
+                    {"operation": operation, "direct": True},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            result = execute_direct_command(direct_command)
+            try_write_action_log(
+                request,
+                operation,
+                {},
+                "succeeded",
+                result=result,
+            )
+            return
+
         plan = select_actions(request)
         selection = {
             "steps": [

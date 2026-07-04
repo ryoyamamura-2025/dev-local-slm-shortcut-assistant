@@ -16,6 +16,23 @@ from urllib.parse import urlencode
 
 
 CLEANUP_LIST_PATH = Path(__file__).with_name("pending_cleanup.txt")
+WSL_VIRTUAL_DISK_PATH = Path(
+    r"C:\Users\kyory\AppData\Local\wsl"
+    r"\{7d85f156-a5cc-4896-83aa-8636104c220d}\ext4.vhdx"
+)
+
+ELEVATED_DISKPART_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+$argument = '/s "{0}"' -f $env:LOCAL_ACTIONS_DISKPART_SCRIPT
+$process = Start-Process `
+    -FilePath "$env:SystemRoot\System32\diskpart.exe" `
+    -ArgumentList $argument `
+    -Verb RunAs `
+    -WindowStyle Hidden `
+    -Wait `
+    -PassThru
+exit $process.ExitCode
+"""
 
 SettingsPage = Literal[
     "system",
@@ -757,3 +774,168 @@ def empty_recycle_bin() -> str:
         hresult = result & 0xFFFFFFFF
         raise OSError(f"ゴミ箱を空にできませんでした（HRESULT 0x{hresult:08X}）。")
     return "ゴミ箱を空にしました。"
+
+
+def clear_temp_files() -> str:
+    """%TMP%直下の削除可能なファイルとフォルダをすべて削除する。"""
+    if sys.platform != "win32":
+        raise OSError("一時ファイルの削除はWindowsでのみ利用できます。")
+
+    temp_value = os.environ.get("TMP")
+    if not temp_value:
+        raise OSError("環境変数TMPが設定されていません。")
+
+    temp_directory = Path(temp_value)
+    if not temp_directory.is_dir():
+        raise OSError(f"一時フォルダが見つかりません: {temp_directory}")
+
+    removed = 0
+    skipped = 0
+    for entry in temp_directory.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if entry.exists():
+            skipped += 1
+        else:
+            removed += 1
+
+    return (
+        f"一時フォルダを掃除しました（削除: {removed}件、"
+        f"スキップ: {skipped}件）。"
+    )
+
+
+def prune_docker_and_compact_wsl() -> str:
+    """Dockerの不要データを削除し、固定パスのWSL仮想ディスクを圧縮する。"""
+    if sys.platform != "win32":
+        raise OSError(
+            "Dockerの掃除とWSL仮想ディスクの圧縮は"
+            "Windowsでのみ利用できます。"
+        )
+    if not WSL_VIRTUAL_DISK_PATH.is_file():
+        raise OSError(
+            "WSL仮想ディスクが見つかりません: "
+            f"{WSL_VIRTUAL_DISK_PATH}"
+        )
+
+    docker_commands = (
+        [
+            "wsl.exe",
+            "--exec",
+            "docker",
+            "image",
+            "prune",
+            "--all",
+            "--force",
+        ],
+        [
+            "wsl.exe",
+            "--exec",
+            "docker",
+            "volume",
+            "prune",
+            "--force",
+        ],
+        [
+            "wsl.exe",
+            "--exec",
+            "docker",
+            "builder",
+            "prune",
+            "--force",
+        ],
+    )
+    for command in docker_commands:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip()
+            raise OSError(
+                f"WSL内のDockerの掃除に失敗しました: {' '.join(command)}"
+                + (f"\n{detail}" if detail else "")
+            )
+
+    shutdown = subprocess.run(
+        ["wsl.exe", "--shutdown"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if shutdown.returncode != 0:
+        detail = shutdown.stderr.strip()
+        raise OSError(
+            "WSLを停止できませんでした。"
+            + (f"\n{detail}" if detail else "")
+        )
+
+    diskpart_commands = "\n".join(
+        [
+            f'select vdisk file="{WSL_VIRTUAL_DISK_PATH}"',
+            "attach vdisk readonly",
+            "compact vdisk",
+            "detach vdisk",
+            "exit",
+            "",
+        ]
+    )
+    script_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".txt",
+            delete=False,
+            mode="w",
+            encoding="utf-8",
+            newline="\r\n",
+        ) as script:
+            script.write(diskpart_commands)
+            script_path = Path(script.name)
+
+        environment = os.environ.copy()
+        environment["LOCAL_ACTIONS_DISKPART_SCRIPT"] = str(script_path)
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                ELEVATED_DISKPART_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip()
+            raise OSError(
+                "WSL仮想ディスクを圧縮できませんでした。"
+                "管理者権限の確認を許可してから再実行してください。"
+                + (f"\n{detail}" if detail else "")
+            )
+    finally:
+        if script_path is not None:
+            script_path.unlink(missing_ok=True)
+
+    return (
+        "Dockerの不要データを削除し、WSL仮想ディスクを圧縮しました。"
+        f"\n{WSL_VIRTUAL_DISK_PATH}"
+    )
