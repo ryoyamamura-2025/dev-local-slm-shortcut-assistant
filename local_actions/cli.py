@@ -30,19 +30,29 @@ def main() -> None:
         direct_command = match_direct_command(request)
         if direct_command is not None:
             operation = direct_command.operation
+            direct_arguments = direct_command.arguments or {}
             print(
                 json.dumps(
-                    {"operation": operation, "direct": True},
+                    {
+                        "operation": operation,
+                        **direct_arguments,
+                        "direct": True,
+                    },
                     ensure_ascii=False,
                     indent=2,
                 )
             )
             result = execute_direct_command(direct_command)
+            status = (
+                "cancelled"
+                if result == "操作をキャンセルしました。"
+                else "succeeded"
+            )
             try_write_action_log(
                 request,
                 operation,
-                {},
-                "succeeded",
+                direct_arguments,
+                status,
                 result=result,
             )
             return

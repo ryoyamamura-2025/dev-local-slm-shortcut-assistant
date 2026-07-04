@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, get_args
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 
 CLEANUP_LIST_PATH = Path(__file__).with_name("pending_cleanup.txt")
@@ -52,6 +52,8 @@ SettingsPage = Literal[
 FolderName = Literal["onedrive", "downloads"]
 
 CalendarEntityType = Literal["タスク", "リマインダ"]
+XDestination = Literal["search", "home", "profile", "likes"]
+X_USERNAME_ENV_VAR = "LOCAL_ACTIONS_X_USERNAME"
 
 CALENDAR_ENTITY_TYPES: tuple[str, ...] = get_args(CalendarEntityType)
 
@@ -274,31 +276,47 @@ def google_maps_search(query: str) -> str:
     )
 
 
-def x_search(query: str) -> str:
-    """Xで投稿を検索する。
+def get_x_username() -> str:
+    """環境変数に固定されたXのユーザー名を検証して返す。"""
+    username = os.environ.get(X_USERNAME_ENV_VAR, "").strip().removeprefix("@")
+    if not username:
+        raise OSError(
+            f"環境変数{X_USERNAME_ENV_VAR}にXのユーザー名を設定してください。"
+        )
+    if (
+        len(username) > 15
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+            for character in username
+        )
+    ):
+        raise ValueError(
+            f"環境変数{X_USERNAME_ENV_VAR}のXユーザー名が不正です。"
+        )
+    return username
+
+
+def x_open(destination: XDestination, query: str = "") -> str:
+    """Xの検索、ホーム、プロフィール、いいねを開く。
 
     Args:
-        query: 日本語を保持した検索語。
+        destination: 開く場所。search、home、profile、likesのいずれか。
+        query: searchで使う検索語。その他では空文字。
     """
-    return "https://x.com/search?" + urlencode(
-        {"q": query, "src": "typed_query"}
-    )
-
-
-def open_url(url: str) -> str:
-    """指定されたウェブサイトを開く。
-
-    Args:
-        url: 開くURL。
-    """
-    if not url.startswith(("https://", "http://")):
-        url = "https://" + url
-    return url
-
-
-def open_chatgpt() -> str:
-    """ChatGPTの新規チャットを開く。"""
-    return "https://chatgpt.com/"
+    if destination == "search":
+        if not query.strip():
+            raise ValueError("Xの検索語が空です。")
+        return "https://x.com/search?" + urlencode(
+            {"q": query, "src": "typed_query"}
+        )
+    if destination == "home":
+        return "https://x.com/home"
+    if destination in {"profile", "likes"}:
+        username = get_x_username()
+        suffix = "/likes" if destination == "likes" else ""
+        return f"https://x.com/{quote(username, safe='')}{suffix}"
+    raise ValueError(f"未対応のX表示先です: {destination}")
 
 
 def get_onedrive_directory() -> Path:
@@ -320,11 +338,6 @@ def get_onedrive_directory() -> Path:
 def get_saved_pages_path() -> Path:
     """保存したページを書き込むOneDrive上のファイルパスを返す。"""
     return get_onedrive_directory() / "saved_pages.md"
-
-
-def get_notes_path() -> Path:
-    """テキストメモを書き込むOneDrive上のファイルパスを返す。"""
-    return get_onedrive_directory() / "notes.md"
 
 
 def get_downloads_directory() -> Path:
@@ -593,38 +606,6 @@ def create_calendar_task(
         register_pending_cleanup(temp_path)
 
     return f"カレンダーの確認画面を開きました: {subject}"
-
-
-def format_text_note(text: str) -> str:
-    """テキストをMarkdownのリスト項目へ変換する。
-
-    Args:
-        text: メモへ追記するテキスト。
-    """
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        raise ValueError("メモするテキストが空です。")
-    lines = normalized.splitlines()
-    return "- " + "\n  ".join(lines) + "\n"
-
-
-def create_text_note(text: str) -> str:
-    """指定されたテキストをOneDrive上の固定メモへ追記する。
-
-    Args:
-        text: 日本語や改行を保持して追記する内容。
-    """
-    entry = format_text_note(text)
-    notes_path = get_notes_path()
-    notes_path.parent.mkdir(parents=True, exist_ok=True)
-    needs_heading = not notes_path.exists() or notes_path.stat().st_size == 0
-
-    with notes_path.open("a", encoding="utf-8", newline="\n") as memo:
-        if needs_heading:
-            memo.write("# Notes\n\n")
-        memo.write(entry)
-
-    return f"メモを保存しました。\n{notes_path}"
 
 
 def get_current_page() -> tuple[str, str]:

@@ -17,8 +17,45 @@ class UrlActionTests(unittest.TestCase):
             "https://www.google.com/search?q=%E7%94%9F%E6%88%90+AI",
         )
 
-    def test_open_url_adds_https_scheme(self) -> None:
-        self.assertEqual(main.open_url("example.com"), "https://example.com")
+    def test_x_search_encodes_japanese_query(self) -> None:
+        self.assertEqual(
+            main.x_open("search", "生成 AI"),
+            "https://x.com/search?q=%E7%94%9F%E6%88%90+AI&src=typed_query",
+        )
+
+    def test_x_open_supports_fixed_destinations(self) -> None:
+        self.assertEqual(main.x_open("home"), "https://x.com/home")
+        with patch.dict(
+            main.os.environ,
+            {main.X_USERNAME_ENV_VAR: "@OpenAI"},
+            clear=True,
+        ):
+            self.assertEqual(
+                main.x_open("likes"),
+                "https://x.com/OpenAI/likes",
+            )
+            self.assertEqual(
+                main.x_open("profile", "OtherUser"),
+                "https://x.com/OpenAI",
+            )
+
+    def test_x_open_requires_configured_username(self) -> None:
+        with (
+            patch.dict(main.os.environ, {}, clear=True),
+            self.assertRaisesRegex(OSError, main.X_USERNAME_ENV_VAR),
+        ):
+            main.x_open("profile")
+
+    def test_x_open_rejects_invalid_configured_username(self) -> None:
+        with (
+            patch.dict(
+                main.os.environ,
+                {main.X_USERNAME_ENV_VAR: "invalid/name"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(ValueError, "ユーザー名が不正"),
+        ):
+            main.x_open("profile")
 
 
 class SaveCurrentPageTests(unittest.TestCase):
@@ -104,7 +141,7 @@ class SaveCurrentPageTests(unittest.TestCase):
             main.get_current_page()
 
 
-class OneDriveNoteTests(unittest.TestCase):
+class OneDriveTests(unittest.TestCase):
     def test_get_onedrive_directory_uses_consumer_folder(self) -> None:
         with TemporaryDirectory() as directory:
             with (
@@ -127,30 +164,6 @@ class OneDriveNoteTests(unittest.TestCase):
             self.assertRaisesRegex(OSError, "OneDriveフォルダを特定"),
         ):
             main.get_onedrive_directory()
-
-    def test_format_text_note_preserves_multiline_text(self) -> None:
-        self.assertEqual(
-            main.format_text_note("買い物\r\n牛乳\nパン"),
-            "- 買い物\n  牛乳\n  パン\n",
-        )
-
-    def test_create_text_note_appends_utf8_markdown(self) -> None:
-        with TemporaryDirectory() as directory:
-            notes_path = Path(directory) / "Local Actions" / "notes.md"
-            with patch(
-                "local_actions.actions.get_notes_path",
-                return_value=notes_path,
-            ):
-                result = main.create_text_note("牛乳を買う")
-                main.create_text_note("パンを買う")
-
-            self.assertEqual(
-                notes_path.read_text(encoding="utf-8"),
-                "# Notes\n\n- 牛乳を買う\n- パンを買う\n",
-            )
-
-        self.assertIn(str(notes_path), result)
-
 
 class CalendarTaskTests(unittest.TestCase):
     def test_format_calendar_ics_includes_escaped_body(self) -> None:
@@ -442,40 +455,6 @@ class CalendarScheduleTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
-    def test_workflow_injects_clipboard_result_into_text_note(self) -> None:
-        calls = Mock()
-        note_input = registry.actions["create_text_note"].accepts_previous_as
-        self.assertEqual(note_input, "text")
-
-        def clipboard() -> str:
-            return "クリップボードの実際の内容"
-
-        def create_note(text: str) -> str:
-            calls(text=text)
-            return "メモを保存しました。"
-
-        plan = [
-            registry.PlannedAction("get_clipboard_text", {}),
-            registry.PlannedAction("create_text_note", {}),
-        ]
-
-        with (
-            patch.dict(
-                registry.actions,
-                {
-                    "get_clipboard_text": registry.Action(clipboard),
-                    "create_text_note": registry.Action(
-                        create_note,
-                        accepts_previous_as=note_input,
-                    ),
-                },
-            ),
-            patch("local_actions.registry.print"),
-        ):
-            registry.execute_workflow(plan)
-
-        calls.assert_called_once_with(text="クリップボードの実際の内容")
-
     def test_workflow_injects_previous_result_into_registered_argument(
         self,
     ) -> None:
@@ -528,7 +507,7 @@ class WorkflowTests(unittest.TestCase):
         clipboard = Mock(return_value="機密情報")
         plan = [
             registry.PlannedAction("get_clipboard_text", {}),
-            registry.PlannedAction("google_search", {"query": "test"}),
+            registry.PlannedAction("lock_pc", {}),
         ]
 
         with (
@@ -589,11 +568,11 @@ class CommandLineOptionTests(unittest.TestCase):
         result = registry.format_action_list()
 
         self.assertIn(f"利用できる操作（{len(registry.actions)}件）", result)
-        self.assertIn("google_search(query)", result)
-        self.assertIn("open_chatgpt()", result)
+        self.assertIn("google_maps_search(query)", result)
+        self.assertIn("x_open(destination, query)", result)
         self.assertIn("open_folder(folder)", result)
-        self.assertIn("Googleで検索する。", result)
-        self.assertIn("empty_recycle_bin() [実行前に確認]", result)
+        self.assertNotIn("google_search(query)", result)
+        self.assertNotIn("empty_recycle_bin()", result)
 
     @patch("local_actions.cli.select_actions")
     @patch("local_actions.cli.print")
@@ -637,6 +616,44 @@ class DirectCommandTests(unittest.TestCase):
         self.assertIsNone(
             direct_commands.match_direct_command("tmp削除して"),
         )
+
+    def test_settings_direct_command_parses_allowlisted_page(self) -> None:
+        command = direct_commands.match_direct_command(
+            "settings windows_update"
+        )
+
+        self.assertIsNotNone(command)
+        assert command is not None
+        self.assertEqual(command.operation, "open_settings")
+        self.assertEqual(command.arguments, {"page": "windows_update"})
+        with self.assertRaisesRegex(ValueError, "未対応の設定ページ"):
+            direct_commands.match_direct_command("settings arbitrary")
+
+    def test_system_info_and_empty_trash_are_direct_commands(self) -> None:
+        self.assertEqual(
+            direct_commands.match_direct_command("sysinfo").operation,
+            "show_system_info",
+        )
+        self.assertEqual(
+            direct_commands.match_direct_command("emptytrash").operation,
+            "empty_recycle_bin",
+        )
+
+    def test_empty_trash_direct_command_requires_confirmation(self) -> None:
+        function = Mock(return_value="ゴミ箱を空にしました。")
+        command = direct_commands.DirectCommand(
+            "empty_recycle_bin",
+            function,
+            confirmation_message="実行しますか？",
+        )
+
+        result = direct_commands.execute_direct_command(
+            command,
+            input_function=lambda _: "n",
+        )
+
+        self.assertEqual(result, "操作をキャンセルしました。")
+        function.assert_not_called()
 
     @patch("local_actions.cli.select_actions")
     @patch("local_actions.cli.execute_direct_command")
@@ -819,22 +836,22 @@ class ActionLogTests(unittest.TestCase):
         execute_workflow: Mock,
     ) -> None:
         select_actions.return_value = [
-            registry.PlannedAction("google_search", {"query": "生成AI"})
+            registry.PlannedAction("google_maps_search", {"query": "大分駅"})
         ]
         execute_workflow.return_value = registry.ActionExecutionResult(
             "succeeded",
-            "https://www.google.com/search?q=生成AI",
+            "https://www.google.com/maps/search/?api=1&query=大分駅",
         )
 
-        with patch("local_actions.cli.sys.argv", ["main.py", "生成AIを検索して"]):
+        with patch("local_actions.cli.sys.argv", ["main.py", "大分駅を地図で検索"]):
             cli.main()
 
         write_log.assert_called_once_with(
-            "生成AIを検索して",
-            "google_search",
-            {"query": "生成AI"},
+            "大分駅を地図で検索",
+            "google_maps_search",
+            {"query": "大分駅"},
             "succeeded",
-            result="https://www.google.com/search?q=生成AI",
+            result="https://www.google.com/maps/search/?api=1&query=大分駅",
         )
 
     @patch(
@@ -868,53 +885,10 @@ class RecycleBinActionTests(unittest.TestCase):
         self.assertEqual(main.open_recycle_bin(), "ゴミ箱を開きました。")
         startfile.assert_called_once_with("shell:RecycleBinFolder")
 
-    def test_empty_recycle_bin_requires_confirmation(self) -> None:
-        action = registry.actions["empty_recycle_bin"]
-        function = Mock(return_value="ゴミ箱を空にしました。")
-
-        with patch.dict(
-            registry.actions,
-            {"empty_recycle_bin": registry.Action(
-                function,
-                confirmation_message=action.confirmation_message,
-            )},
-        ):
-            executed = registry.execute_action(
-                "empty_recycle_bin",
-                {},
-                input_function=lambda _: "n",
-            )
-
-        self.assertFalse(executed)
-        function.assert_not_called()
-
-    def test_empty_recycle_bin_runs_after_confirmation(self) -> None:
-        call_tracker = Mock()
-
-        def function() -> str:
-            call_tracker()
-            return "ゴミ箱を空にしました。"
-
-        with patch.dict(
-            registry.actions,
-            {"empty_recycle_bin": registry.Action(
-                function,
-                confirmation_message="実行しますか？",
-            )},
-        ):
-            executed = registry.execute_action(
-                "empty_recycle_bin",
-                {"args": {}},
-                input_function=lambda _: "y",
-            )
-
-        self.assertTrue(executed)
-        call_tracker.assert_called_once_with()
-
     def test_action_with_arguments_rejects_unknown_field(self) -> None:
         with self.assertRaisesRegex(ValueError, "未定義の引数"):
             registry.execute_action(
-                "google_search",
+                "google_maps_search",
                 {"query": "生成AI", "args": {}},
             )
 

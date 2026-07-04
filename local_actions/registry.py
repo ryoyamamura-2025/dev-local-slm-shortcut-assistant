@@ -7,19 +7,12 @@ from typing import Any, Literal
 from local_actions.actions import (
     copy_text,
     create_calendar_task,
-    create_text_note,
-    empty_recycle_bin,
     get_clipboard_text,
     google_maps_search,
-    google_search,
     lock_pc,
-    open_chatgpt,
     open_folder,
-    open_settings,
-    open_url,
     save_current_page,
-    show_system_info,
-    x_search,
+    x_open,
 )
 
 
@@ -56,27 +49,14 @@ class ActionExecutionResult:
 actions = {
     action.function.__name__: action
     for action in [
-        Action(google_search, open_result_in_browser=True),
         Action(google_maps_search, open_result_in_browser=True),
-        Action(x_search, open_result_in_browser=True),
-        Action(open_url, open_result_in_browser=True),
-        Action(open_chatgpt, open_result_in_browser=True),
+        Action(x_open, open_result_in_browser=True),
         Action(open_folder),
-        Action(open_settings),
         Action(copy_text),
-        Action(create_text_note, accepts_previous_as="text"),
         Action(get_clipboard_text),
         Action(create_calendar_task, accepts_previous_as="body"),
-        Action(show_system_info),
         Action(lock_pc),
         Action(save_current_page),
-        Action(
-            empty_recycle_bin,
-            confirmation_message=(
-                "ゴミ箱内のすべての項目を完全に削除します。"
-                "この操作は元に戻せません。実行しますか？"
-            ),
-        ),
     ]
 }
 
