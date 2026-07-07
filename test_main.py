@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 
 from local_actions import action_log
 from local_actions import actions as main
-from local_actions import cli, direct_commands, registry, slm
+from local_actions import cli, direct_commands, registry, slm, uia_agent
 
 
 class UrlActionTests(unittest.TestCase):
@@ -1006,6 +1006,172 @@ class RecycleBinActionTests(unittest.TestCase):
         self.assertEqual(environment["LOCAL_ACTIONS_COPILOT_MODEL"], "Opus")
         self.assertIn("Copilot", result)
 
+class UiaAgentTests(unittest.TestCase):
+    def test_validate_uia_plan_accepts_known_element(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+
+        plan = uia_agent.validate_uia_plan(
+            {"element_id": "e0", "action": "click", "reason": "matches"},
+            elements,
+        )
+
+        self.assertEqual(plan.element_id, "e0")
+        self.assertEqual(plan.action, "click")
+
+
+    def test_validate_uia_plan_clears_text_for_click(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+
+        plan = uia_agent.validate_uia_plan(
+            {"element_id": "e0", "action": "click", "text": "ignored"},
+            elements,
+        )
+
+        self.assertEqual(plan.text, "")
+
+    def test_candidate_elements_prefers_request_matching_names(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="こんにちはの返答迷走 の会話オプションを開く",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            ),
+            uia_agent.UiaElement(
+                id="e1",
+                index=1,
+                type="Button",
+                name="送信",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            ),
+        ]
+
+        candidates = uia_agent.candidate_elements_for_request("送信して", elements)
+
+        self.assertEqual(candidates[0].id, "e1")
+
+    def test_validate_uia_plan_rejects_unknown_element(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Unknown element_id"):
+            uia_agent.validate_uia_plan(
+                {"element_id": "e1", "action": "click"},
+                elements,
+            )
+
+    def test_list_window_elements_parses_powershell_json(self) -> None:
+        payload = {
+            "window": {"name": "Calculator"},
+            "elements": [
+                {
+                    "id": "e0",
+                    "index": 0,
+                    "automation_id": "num1Button",
+                    "type": "Button",
+                    "name": "One",
+                    "bounds": {"x": 10, "y": 20, "width": 30, "height": 40},
+                    "enabled": True,
+                }
+            ],
+        }
+
+        with (
+            patch("local_actions.uia_agent.sys.platform", "win32"),
+            patch("local_actions.uia_agent.subprocess.run") as run,
+        ):
+            run.return_value = Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+            elements = uia_agent.list_window_elements()
+
+        self.assertEqual(elements[0].id, "e0")
+        self.assertEqual(elements[0].automation_id, "num1Button")
+        self.assertEqual(elements[0].bounds["width"], 30)
+        self.assertEqual(run.call_args.args[0][:5], [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-Command",
+        ])
+
+    def test_execute_uia_plan_rejects_disabled_element_before_powershell(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=False,
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            uia_agent.execute_uia_plan(
+                uia_agent.UiaPlan(element_id="e0", action="click"),
+                elements,
+            )
+
+    def test_main_list_elements_prints_elements_without_slm(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+                automation_id="okButton",
+            )
+        ]
+
+        with (
+            patch("local_actions.uia_agent.sys.argv", ["uia_agent.py", "--list-elements"]),
+            patch("local_actions.uia_agent.list_window_elements", return_value=elements) as list_elements,
+            patch("local_actions.uia_agent.chat") as chat,
+            patch("builtins.print") as print_mock,
+        ):
+            uia_agent.main()
+
+        list_elements.assert_called_once_with(window_title="", foreground=True)
+        chat.assert_not_called()
+        printed = print_mock.call_args.args[0]
+        payload = json.loads(printed)
+        self.assertEqual(payload[0]["id"], "e0")
+        self.assertEqual(payload[0]["automation_id"], "okButton")
 
 if __name__ == "__main__":
     unittest.main()
