@@ -131,6 +131,9 @@ $UseForeground = $env:LOCAL_ACTIONS_UIA_FOREGROUND -eq "1"
 $ElementIndex = [int]$env:LOCAL_ACTIONS_UIA_ELEMENT_INDEX
 $Action = $env:LOCAL_ACTIONS_UIA_ACTION
 $Text = $env:LOCAL_ACTIONS_UIA_TEXT
+$ExpectedAutomationId = $env:LOCAL_ACTIONS_UIA_EXPECTED_AUTOMATION_ID
+$ExpectedName = $env:LOCAL_ACTIONS_UIA_EXPECTED_NAME
+$ExpectedType = $env:LOCAL_ACTIONS_UIA_EXPECTED_TYPE
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -202,7 +205,7 @@ function Invoke-Click {
     for ($i = 0; $i -lt 5; $i++) {
         try {
             $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-            return
+            return $target
         } catch {}
 
         try {
@@ -212,7 +215,7 @@ function Invoke-Click {
             [UiaWin32]::mouse_event(0x0002, [int]$point.X, [int]$point.Y, 0, [UIntPtr]::Zero)
             Start-Sleep -Milliseconds 50
             [UiaWin32]::mouse_event(0x0004, [int]$point.X, [int]$point.Y, 0, [UIntPtr]::Zero)
-            return
+            return $target
         } catch {}
 
         try {
@@ -225,7 +228,7 @@ function Invoke-Click {
                 [UiaWin32]::mouse_event(0x0002, $x, $y, 0, [UIntPtr]::Zero)
                 Start-Sleep -Milliseconds 50
                 [UiaWin32]::mouse_event(0x0004, $x, $y, 0, [UIntPtr]::Zero)
-                return
+                return $target
             }
         } catch {}
 
@@ -235,6 +238,39 @@ function Invoke-Click {
     }
 
     throw "Element cannot be clicked: e$ElementIndex"
+}
+
+function Set-ElementText {
+    param(
+        [System.Windows.Automation.AutomationElement]$Element,
+        [string]$Value
+    )
+    try {
+        $pattern = $Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $pattern.SetValue($Value)
+        return
+    } catch {}
+
+    $previousClipboardData = $null
+    try {
+        $previousClipboardData = [System.Windows.Forms.Clipboard]::GetDataObject()
+    } catch {}
+
+    try {
+        $Element.SetFocus()
+        [System.Windows.Forms.Clipboard]::SetText($Value)
+        [System.Windows.Forms.SendKeys]::SendWait("^a")
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 100
+    } finally {
+        try {
+            if ($null -ne $previousClipboardData) {
+                [System.Windows.Forms.Clipboard]::SetDataObject($previousClipboardData, $true)
+            } else {
+                [System.Windows.Forms.Clipboard]::Clear()
+            }
+        } catch {}
+    }
 }
 
 $target = Get-TargetWindow
@@ -248,20 +284,28 @@ if (-not $element.Current.IsEnabled) {
     throw "Target element is disabled: e$ElementIndex"
 }
 
+$actualAutomationId = $element.Current.AutomationId
+$actualName = $element.Current.Name
+$actualType = ($element.Current.ControlType.ProgrammaticName -replace "^ControlType\.", "")
+$isSameElement = $true
+if (-not [string]::IsNullOrWhiteSpace($ExpectedAutomationId)) {
+    $isSameElement = $actualAutomationId -eq $ExpectedAutomationId
+} else {
+    $isSameElement = ($actualName -eq $ExpectedName) -and ($actualType -eq $ExpectedType)
+}
+if (-not $isSameElement) {
+    throw ("UI changed since observation; element e$ElementIndex no longer matches " +
+        "(expected type=$ExpectedType name=$ExpectedName automation_id=$ExpectedAutomationId, " +
+        "got type=$actualType name=$actualName automation_id=$actualAutomationId).")
+}
+
+$actedElement = $element
 if ($Action -eq "focus") {
     $element.SetFocus()
 } elseif ($Action -eq "click") {
-    Invoke-Click -Element $element
+    $actedElement = Invoke-Click -Element $element
 } elseif ($Action -eq "set_text") {
-    try {
-        $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-        $pattern.SetValue($Text)
-    } catch {
-        $element.SetFocus()
-        [System.Windows.Forms.Clipboard]::SetText($Text)
-        [System.Windows.Forms.SendKeys]::SendWait("^a")
-        [System.Windows.Forms.SendKeys]::SendWait("^v")
-    }
+    Set-ElementText -Element $element -Value $Text
 } else {
     throw "Unsupported UIA action: $Action"
 }
@@ -269,8 +313,9 @@ if ($Action -eq "focus") {
 [PSCustomObject]@{
     element_id = "e$ElementIndex"
     action = $Action
-    name = $element.Current.Name
-    type = ($element.Current.ControlType.ProgrammaticName -replace "^ControlType\.", "")
+    name = $actedElement.Current.Name
+    type = ($actedElement.Current.ControlType.ProgrammaticName -replace "^ControlType\.", "")
+    delegated_to_ancestor = ($actedElement -ne $element)
 } | ConvertTo-Json -Compress
 """
 
@@ -559,24 +604,33 @@ def loop_candidate_elements(
     diff: UiaSnapshotDiff,
     limit: int = 70,
 ) -> list[UiaElement]:
-    """Prioritize changed UI while keeping enough current context for the next action."""
+    """Prioritize changed UI and request-relevant elements without letting either crowd out the other."""
     ordered: list[UiaElement] = []
     seen: set[str] = set()
 
-    def add_many(candidates: list[UiaElement]) -> None:
+    def add_many(candidates: list[UiaElement], budget: int) -> None:
+        added = 0
         for element in candidates:
-            if element.id not in seen and element in elements:
-                ordered.append(element)
-                seen.add(element.id)
+            if added >= budget:
+                break
+            if element.id in seen:
+                continue
+            ordered.append(element)
+            seen.add(element.id)
+            added += 1
 
-    add_many(diff.added)
-    add_many(diff.changed)
-    add_many(candidate_elements_for_request(request, elements, limit=limit))
-    add_many([
-        element for element in elements
-        if element.enabled and element.type in {"Button", "SplitButton", "MenuItem", "Hyperlink", "Edit", "Document"}
-    ])
-    add_many(elements)
+    diff_elements = diff.added + diff.changed
+    diff_elements.sort(key=lambda element: -_score_element_for_request(request, element))
+    add_many(diff_elements, budget=max(limit // 2, 1))
+    add_many(candidate_elements_for_request(request, elements, limit=limit), budget=limit)
+    add_many(
+        [
+            element for element in elements
+            if element.enabled and element.type in {"Button", "SplitButton", "MenuItem", "Hyperlink", "Edit", "Document"}
+        ],
+        budget=limit,
+    )
+    add_many(elements, budget=limit)
     return ordered[:limit]
 
 
@@ -796,6 +850,9 @@ def execute_uia_plan(
     environment["LOCAL_ACTIONS_UIA_ELEMENT_INDEX"] = str(element.index)
     environment["LOCAL_ACTIONS_UIA_ACTION"] = plan.action
     environment["LOCAL_ACTIONS_UIA_TEXT"] = plan.text
+    environment["LOCAL_ACTIONS_UIA_EXPECTED_AUTOMATION_ID"] = element.automation_id
+    environment["LOCAL_ACTIONS_UIA_EXPECTED_NAME"] = element.name
+    environment["LOCAL_ACTIONS_UIA_EXPECTED_TYPE"] = element.type
     output = _run_powershell(EXECUTE_PLAN_SCRIPT, environment)
     return output.strip()
 
