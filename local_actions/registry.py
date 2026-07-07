@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from local_actions.actions import (
     capture,
+    copilot_chat,
     copy_text,
     create_calendar_task,
     get_clipboard_text,
@@ -59,6 +60,7 @@ actions = {
         Action(get_current_page, passthrough=True),
         Action(capture, accepts_previous_as="body"),
         Action(create_calendar_task, accepts_previous_as="body"),
+        Action(copilot_chat, accepts_previous_as="message"),
         Action(lock_pc),
     ]
 }

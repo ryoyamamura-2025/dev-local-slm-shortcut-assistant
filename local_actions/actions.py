@@ -18,9 +18,263 @@ from openpyxl import Workbook, load_workbook
 
 
 CLEANUP_LIST_PATH = Path(__file__).with_name("pending_cleanup.txt")
+COPILOT_URL = "https://m365.cloud.microsoft/chat"
+
+COPILOT_CHAT_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$Message = $env:LOCAL_ACTIONS_COPILOT_MESSAGE
+$Model   = $env:LOCAL_ACTIONS_COPILOT_MODEL
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class Win32 {
+    public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumChildProc cb, IntPtr lp);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int n);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint c, uint e);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+
+    public static IntPtr FindChildByClass(IntPtr parent, string cls) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildProc cb = (hWnd, _) => {
+            var sb = new StringBuilder(256);
+            GetClassName(hWnd, sb, 256);
+            if (sb.ToString() == cls) { found = hWnd; return false; }
+            return true;
+        };
+        EnumChildWindows(parent, cb, IntPtr.Zero);
+        GC.KeepAlive(cb);
+        return found;
+    }
+}
+"@
+
+function Click-Element {
+    param([System.Windows.Automation.AutomationElement]$El)
+    # Try InvokePattern, then mouse click, then walk up to parent (child text elements have no clickable point)
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $target = $El
+    for ($i = 0; $i -lt 4; $i++) {
+        try {
+            $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            return
+        } catch {}
+        try {
+            $pt = $target.GetClickablePoint()
+            [Win32]::SetCursorPos([int]$pt.X, [int]$pt.Y) | Out-Null
+            Start-Sleep -Milliseconds 80
+            [Win32]::mouse_event(0x0002, [int]$pt.X, [int]$pt.Y, 0, 0)
+            Start-Sleep -Milliseconds 50
+            [Win32]::mouse_event(0x0004, [int]$pt.X, [int]$pt.Y, 0, 0)
+            return
+        } catch {}
+        $parent = $walker.GetParent($target)
+        if ($null -eq $parent) { break }
+        $target = $parent
+    }
+    throw "要素をクリックできませんでした"
+}
+
+# Search one control type per call (avoids nested ::new parsing issues)
+function Find-ByName {
+    param(
+        [System.Windows.Automation.AutomationElement]$Root,
+        [System.Windows.Automation.ControlType]$Type,
+        [string]$NamePattern,
+        [int]$Sec = 15
+    )
+    $typeCond = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        $Type
+    )
+    $until = (Get-Date).AddSeconds($Sec)
+    while ((Get-Date) -lt $until) {
+        $els = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond)
+        foreach ($el in $els) {
+            try { if ($el.Current.Name -like $NamePattern) { return $el } } catch {}
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $null
+}
+
+# Search multiple control types in each polling iteration (no sequential timeout waste)
+function Find-ByNameAny {
+    param(
+        [System.Windows.Automation.AutomationElement]$Root,
+        [System.Windows.Automation.ControlType[]]$Types,
+        [string]$NamePattern,
+        [int]$Sec = 8
+    )
+    $until = (Get-Date).AddSeconds($Sec)
+    while ((Get-Date) -lt $until) {
+        foreach ($ct in $Types) {
+            $typeCond = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                $ct
+            )
+            $els = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond)
+            foreach ($el in $els) {
+                try {
+                    if ($el.Current.Name -like $NamePattern -and -not $el.Current.IsOffscreen) {
+                        return $el
+                    }
+                } catch {}
+            }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $null
+}
+
+# 1. Find Edge window with Copilot tab
+$edgeWindow = $null
+$until = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $until) {
+    $wins = ([System.Windows.Automation.AutomationElement]::RootElement).FindAll(
+        [System.Windows.Automation.TreeScope]::Children,
+        [System.Windows.Automation.Condition]::TrueCondition
+    )
+    foreach ($w in $wins) {
+        try {
+            if ($w.Current.ClassName -like "*Chrome_WidgetWin*" -and
+                $w.Current.Name -like "*Copilot*") {
+                $edgeWindow = $w; break
+            }
+        } catch {}
+    }
+    if ($null -ne $edgeWindow) { break }
+    Start-Sleep -Milliseconds 500
+}
+if ($null -eq $edgeWindow) { throw "M365 CopilotのEdgeウィンドウが見つかりません。" }
+
+# 2. Restore only if minimized to avoid un-maximizing, then bring to front
+$hwnd = [IntPtr]::new($edgeWindow.Current.NativeWindowHandle)
+if ([Win32]::IsIconic($hwnd)) { [Win32]::ShowWindow($hwnd, 9) | Out-Null }
+[Win32]::SetForegroundWindow($hwnd) | Out-Null
+Start-Sleep -Milliseconds 600
+
+# 3. Find render widget via Win32 child enumeration, fall back to edge window
+$renderHwnd = [Win32]::FindChildByClass($hwnd, "Chrome_RenderWidgetHostHWND")
+if ($renderHwnd -ne [IntPtr]::Zero) {
+    try { $searchRoot = [System.Windows.Automation.AutomationElement]::FromHandle($renderHwnd) }
+    catch { $searchRoot = $edgeWindow }
+} else { $searchRoot = $edgeWindow }
+
+# 4. Change model if needed
+if ($Model -ne "自動") {
+    # Try Button / SplitButton / ComboBox across render widget then full edge window
+    $btn = $null
+    :btnSearch foreach ($root in @($searchRoot, $edgeWindow)) {
+        foreach ($ct in @(
+            [System.Windows.Automation.ControlType]::Button,
+            [System.Windows.Automation.ControlType]::SplitButton,
+            [System.Windows.Automation.ControlType]::ComboBox
+        )) {
+            $btn = Find-ByName -Root $root -Type $ct -NamePattern "*モデル セレクター*" -Sec 3
+            if ($null -ne $btn) { break btnSearch }
+        }
+    }
+
+    if ($null -eq $btn) {
+        # Diagnostic: dump all Button names to identify actual element name
+        $diagCond = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+        $diagEls = $edgeWindow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $diagCond)
+        $diagNames = @()
+        foreach ($el in $diagEls) {
+            try { $n = $el.Current.Name; if ($n) { $diagNames += $n } } catch {}
+        }
+        throw "モデル選択ボタン（自動）が見つかりません。`n検出されたButton名: $(($diagNames | Sort-Object -Unique) -join ' | ')"
+    }
+
+    Click-Element $btn
+    Start-Sleep -Milliseconds 500  # Wait for Fluent UI popup to render
+
+    # TrueCondition search — finds Opus regardless of control type or offscreen state
+    $opt = $null
+    $until = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $until) {
+        $allEls = $edgeWindow.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+        foreach ($el in $allEls) {
+            try {
+                if ($el.Current.Name -like "*$Model*" -and $el.Current.IsEnabled -and
+                    $el.Current.Name -ne "モデル セレクター") {
+                    $opt = $el; break
+                }
+            } catch {}
+        }
+        if ($null -ne $opt) { break }
+        Start-Sleep -Milliseconds 400
+    }
+
+    if ($null -eq $opt) { throw "${Model}オプションが見つかりません。" }
+    Click-Element $opt
+    Start-Sleep -Milliseconds 500
+}
+
+# 5. Find chat input: Edit (any name), then focusable Document
+$chatInput = $null
+:chatSearch foreach ($root in @($searchRoot, $edgeWindow)) {
+    $chatInput = Find-ByName -Root $root -Type ([System.Windows.Automation.ControlType]::Edit) -NamePattern "*" -Sec 5
+    if ($null -ne $chatInput) { break chatSearch }
+    $docTypeCond = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Document
+    )
+    $focusCond = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty,
+        $true
+    )
+    $docCond = [System.Windows.Automation.AndCondition]::new($docTypeCond, $focusCond)
+    $chatInput = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+    if ($null -ne $chatInput) { break chatSearch }
+}
+if ($null -eq $chatInput) {
+    # Diagnostic: dump Edit and Document names
+    $diagNames = @()
+    foreach ($ct in @([System.Windows.Automation.ControlType]::Edit, [System.Windows.Automation.ControlType]::Document)) {
+        $cond = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct
+        )
+        $els = $edgeWindow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        foreach ($el in $els) {
+            try { $diagNames += "$($ct.ProgrammaticName): $($el.Current.Name)" } catch {}
+        }
+    }
+    throw "チャット入力欄が見つかりません。`n検出されたEdit/Document名: $($diagNames -join ' | ')"
+}
+
+# 6. Paste and send
+$chatInput.SetFocus()
+Start-Sleep -Milliseconds 200
+[System.Windows.Forms.Clipboard]::SetText($Message)
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+Start-Sleep -Milliseconds 300
+[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+
+"Copilot（モデル: $Model）にメッセージを送信しました。"
+"""
 WSL_VIRTUAL_DISK_PATH = Path(
-    r"C:\Users\kyory\AppData\Local\wsl"
-    r"\{7d85f156-a5cc-4896-83aa-8636104c220d}\ext4.vhdx"
+    r"C:\Users\k250501260\AppData\Local\Packages"
+    r"\CanonicalGroupLimited.Ubuntu22.04LTS_79rhkp1fndgsc\LocalState\ext4.vhdx"
 )
 
 ELEVATED_DISKPART_SCRIPT = r"""
@@ -755,11 +1009,19 @@ def empty_recycle_bin() -> str:
     if sys.platform != "win32":
         raise OSError("ゴミ箱を空にする操作はWindowsでのみ利用できます。")
 
-    flags = 0x0001 | 0x0002 | 0x0004
-    result = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
-    if result != 0:
-        hresult = result & 0xFFFFFFFF
-        raise OSError(f"ゴミ箱を空にできませんでした（HRESULT 0x{hresult:08X}）。")
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.stderr.strip():
+        raise OSError(f"ゴミ箱を空にできませんでした: {result.stderr.strip()}")
     return "ゴミ箱を空にしました。"
 
 
@@ -768,11 +1030,7 @@ def clear_temp_files() -> str:
     if sys.platform != "win32":
         raise OSError("一時ファイルの削除はWindowsでのみ利用できます。")
 
-    temp_value = os.environ.get("TMP")
-    if not temp_value:
-        raise OSError("環境変数TMPが設定されていません。")
-
-    temp_directory = Path(temp_value)
+    temp_directory = Path(tempfile.gettempdir())
     if not temp_directory.is_dir():
         raise OSError(f"一時フォルダが見つかりません: {temp_directory}")
 
@@ -793,9 +1051,53 @@ def clear_temp_files() -> str:
             removed += 1
 
     return (
-        f"一時フォルダを掃除しました（削除: {removed}件、"
-        f"スキップ: {skipped}件）。"
+        f"一時フォルダを掃除しました（パス: {temp_directory}、"
+        f"削除: {removed}件、スキップ: {skipped}件）。"
     )
+
+
+def copilot_chat(message: str, model: str = "Opus") -> str:
+    """M365 Copilotのチャット欄にメッセージを送信する。
+
+    Args:
+        message: 送信するメッセージ。日本語を保持したまま渡す。
+        model: 使用するモデル。Opus、Think Deeper、Quick Response、自動など。
+    """
+    if sys.platform != "win32":
+        raise OSError("Copilotチャットの送信はWindowsでのみ利用できます。")
+    if not message.strip():
+        raise ValueError("送信するメッセージが空です。")
+
+    os.startfile(COPILOT_URL)
+
+    environment = os.environ.copy()
+    environment["LOCAL_ACTIONS_COPILOT_MESSAGE"] = message
+    environment["LOCAL_ACTIONS_COPILOT_MODEL"] = model
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-Command",
+            COPILOT_CHAT_SCRIPT,
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()
+        raise OSError(
+            "Copilotへのメッセージ送信に失敗しました。"
+            + (f"\n{detail}" if detail else "")
+        )
+    return completed.stdout.strip() or f"Copilot（モデル: {model}）にメッセージを送信しました。"
 
 
 def prune_docker_and_compact_wsl() -> str:

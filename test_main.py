@@ -632,6 +632,7 @@ class CommandLineOptionTests(unittest.TestCase):
         self.assertIn("open_folder(folder)", result)
         self.assertIn("get_current_page()", result)
         self.assertIn("capture(kind, title, body)", result)
+        self.assertIn("copilot_chat(message, model)", result)
         self.assertNotIn("save_current_page()", result)
         self.assertNotIn("google_search(query)", result)
         self.assertNotIn("empty_recycle_bin()", result)
@@ -760,7 +761,10 @@ class DirectCommandTests(unittest.TestCase):
 
             with (
                 patch("local_actions.actions.sys.platform", "win32"),
-                patch.dict("local_actions.actions.os.environ", {"TMP": directory}),
+                patch(
+                    "local_actions.actions.tempfile.gettempdir",
+                    return_value=directory,
+                ),
                 patch("pathlib.Path.unlink", new=unlink),
             ):
                 result = main.clear_temp_files()
@@ -954,15 +958,53 @@ class RecycleBinActionTests(unittest.TestCase):
                 {"query": "生成AI", "args": {}},
             )
 
-    @patch(
-        "local_actions.actions.ctypes.windll.shell32.SHEmptyRecycleBinW",
-        return_value=0,
-    )
-    def test_empty_recycle_bin_calls_windows_api(self, empty: Mock) -> None:
+    @patch("local_actions.actions.subprocess.run")
+    def test_empty_recycle_bin_uses_fixed_powershell_command(
+        self,
+        run: Mock,
+    ) -> None:
+        run.return_value = Mock(stderr="")
+
         with patch("local_actions.actions.sys.platform", "win32"):
             self.assertEqual(main.empty_recycle_bin(), "ゴミ箱を空にしました。")
 
-        empty.assert_called_once_with(None, None, 0x0001 | 0x0002 | 0x0004)
+        run.assert_called_once_with(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    @patch("local_actions.actions.subprocess.run")
+    @patch("local_actions.actions.os.startfile")
+    def test_copilot_chat_opens_allowed_url_and_passes_message_env(
+        self,
+        startfile: Mock,
+        run: Mock,
+    ) -> None:
+        run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        with patch("local_actions.actions.sys.platform", "win32"):
+            result = main.copilot_chat("要約して", "Opus")
+
+        startfile.assert_called_once_with(main.COPILOT_URL)
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(command[:5], [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-Command",
+        ])
+        self.assertEqual(environment["LOCAL_ACTIONS_COPILOT_MESSAGE"], "要約して")
+        self.assertEqual(environment["LOCAL_ACTIONS_COPILOT_MODEL"], "Opus")
+        self.assertIn("Copilot", result)
 
 
 if __name__ == "__main__":
