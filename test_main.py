@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
@@ -1088,6 +1089,146 @@ class UiaAgentTests(unittest.TestCase):
                 {"element_id": "e1", "action": "click"},
                 elements,
             )
+
+    def test_select_uia_plan_with_tools_accepts_single_tool_call(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+        response = Mock(
+            message=Mock(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(function=SimpleNamespace(name="click", arguments={"element_id": "e0"}))
+                ],
+            )
+        )
+
+        with patch("local_actions.uia_agent.chat", return_value=response) as chat:
+            plan = uia_agent.select_uia_plan_with_tools("OK を押して", elements)
+
+        self.assertEqual(plan.element_id, "e0")
+        self.assertEqual(plan.action, "click")
+        self.assertIn("tools", chat.call_args.kwargs)
+        self.assertNotIn("format", chat.call_args.kwargs)
+
+    def test_tool_call_payload_rejects_missing_tool_call_with_content(self) -> None:
+        response = Mock(
+            message=Mock(
+                content="JSON を返してしまいました",
+                tool_calls=[],
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "JSON を返してしまいました"):
+            uia_agent._single_tool_call_payload(response, {"click"})
+
+    def test_tool_call_payload_rejects_multiple_tool_calls(self) -> None:
+        response = Mock(
+            message=Mock(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(function=SimpleNamespace(name="click", arguments={"element_id": "e0"})),
+                    SimpleNamespace(function=SimpleNamespace(name="focus", arguments={"element_id": "e1"})),
+                ],
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "multiple UI Automation tool calls"):
+            uia_agent._single_tool_call_payload(response, {"click", "focus"})
+
+    def test_select_uia_loop_decision_with_tools_accepts_wait(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+        response = Mock(
+            message=Mock(
+                content="",
+                tool_calls=[SimpleNamespace(function=SimpleNamespace(name="wait", arguments={"seconds": 9}))],
+            )
+        )
+
+        with patch("local_actions.uia_agent.chat", return_value=response):
+            decision = uia_agent.select_uia_loop_decision_with_tools(
+                request="待って",
+                elements=elements,
+                diff=uia_agent.diff_snapshots(None, elements),
+                last_action=None,
+                turn=1,
+                max_turns=3,
+            )
+
+        self.assertEqual(decision.action, "wait")
+        self.assertEqual(decision.seconds, 5.0)
+
+    def test_select_uia_loop_decision_with_tools_accepts_done(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=True,
+            )
+        ]
+        response = Mock(
+            message=Mock(
+                content="",
+                tool_calls=[SimpleNamespace(function=SimpleNamespace(name="done", arguments={}))],
+            )
+        )
+
+        with patch("local_actions.uia_agent.chat", return_value=response):
+            decision = uia_agent.select_uia_loop_decision_with_tools(
+                request="終わって",
+                elements=elements,
+                diff=uia_agent.diff_snapshots(None, elements),
+                last_action=None,
+                turn=1,
+                max_turns=3,
+            )
+
+        self.assertEqual(decision.action, "done")
+
+    def test_select_uia_plan_with_tools_rejects_disabled_element(self) -> None:
+        elements = [
+            uia_agent.UiaElement(
+                id="e0",
+                index=0,
+                type="Button",
+                name="OK",
+                bounds={"x": 1, "y": 2, "width": 30, "height": 20},
+                enabled=False,
+            )
+        ]
+        response = Mock(
+            message=Mock(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(function=SimpleNamespace(name="click", arguments={"element_id": "e0"}))
+                ],
+            )
+        )
+
+        with (
+            patch("local_actions.uia_agent.chat", return_value=response),
+            self.assertRaisesRegex(ValueError, "disabled"),
+        ):
+            uia_agent.select_uia_plan_with_tools("OK を押して", elements)
 
     def test_list_window_elements_parses_powershell_json(self) -> None:
         payload = {

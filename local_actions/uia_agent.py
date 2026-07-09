@@ -11,7 +11,7 @@ from typing import Any, Literal
 from ollama import chat
 
 
-MODEL = "qwen3:1.7b"
+MODEL = "qwen3.5:0.8b"
 MAX_ELEMENTS = 120
 DEFAULT_MAX_TURNS = 5
 DEFAULT_SETTLE_SECONDS = 0.5
@@ -649,6 +649,145 @@ def build_loop_decision_schema() -> dict[str, Any]:
     }
 
 
+def build_uia_action_tools(include_loop_actions: bool = False) -> list[dict[str, Any]]:
+    """Build fixed Ollama tools for selecting UI Automation actions."""
+    tools: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "click",
+                "description": "Click one UI Automation element from the current element list.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["element_id"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "element_id": {"type": "string", "pattern": "^e[0-9]+$"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "set_text",
+                "description": "Set text on one UI Automation element from the current element list.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["element_id", "text"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "element_id": {"type": "string", "pattern": "^e[0-9]+$"},
+                        "text": {"type": "string"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "focus",
+                "description": "Focus one UI Automation element from the current element list.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["element_id"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "element_id": {"type": "string", "pattern": "^e[0-9]+$"},
+                    },
+                },
+            },
+        },
+    ]
+    if include_loop_actions:
+        tools.extend(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "wait",
+                        "description": "Wait briefly when the UI is likely still loading.",
+                        "parameters": {
+                            "type": "object",
+                            "required": [],
+                            "additionalProperties": False,
+                            "properties": {
+                                "seconds": {"type": "number"},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "done",
+                        "description": "Finish when the user goal is complete or no safe action remains.",
+                        "parameters": {
+                            "type": "object",
+                            "required": [],
+                            "additionalProperties": False,
+                            "properties": {},
+                        },
+                    },
+                },
+            ]
+        )
+    return tools
+
+
+def _tool_call_arguments(tool_call: Any) -> dict[str, Any]:
+    """Return Ollama tool-call arguments as a dictionary."""
+    arguments = tool_call.function.arguments
+    if isinstance(arguments, dict):
+        return dict(arguments)
+    if isinstance(arguments, str):
+        try:
+            payload = json.loads(arguments)
+        except json.JSONDecodeError as error:
+            raise ValueError("SLM returned invalid UI Automation tool arguments.") from error
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("SLM returned non-object UI Automation tool arguments.")
+
+
+def _single_tool_call_payload(response: Any, allowed_tools: set[str]) -> dict[str, Any]:
+    """Convert exactly one Ollama tool call into a validation payload."""
+    message = response.message
+    tool_calls = list(message.tool_calls or [])
+    if not tool_calls:
+        content = str(getattr(message, "content", "") or "")
+        detail = "\nMessage content:\n" + content if content else ""
+        raise ValueError("SLM did not return a UI Automation tool call." + detail)
+    if len(tool_calls) != 1:
+        names = []
+        for tool_call in tool_calls:
+            try:
+                names.append(str(tool_call.function.name))
+            except AttributeError:
+                names.append("<unknown>")
+        raise ValueError(
+            "SLM returned multiple UI Automation tool calls; expected exactly one. "
+            f"Tool calls: {', '.join(names)}"
+        )
+
+    tool_call = tool_calls[0]
+    name = str(tool_call.function.name)
+    if name not in allowed_tools:
+        raise ValueError(f"Unsupported UI Automation tool call: {name}")
+
+    arguments = _tool_call_arguments(tool_call)
+    if name in {"click", "set_text", "focus"}:
+        return {
+            "action": name,
+            "element_id": arguments.get("element_id", ""),
+            "text": arguments.get("text", ""),
+        }
+    if name == "wait":
+        return {"action": name, "seconds": arguments.get("seconds", DEFAULT_SETTLE_SECONDS)}
+    if name == "done":
+        return {"action": name}
+    raise ValueError(f"Unsupported UI Automation tool call: {name}")
+
 def validate_loop_decision(
     payload: dict[str, Any],
     elements: list[UiaElement],
@@ -662,8 +801,12 @@ def validate_loop_decision(
     if action in {"click", "set_text", "focus"}:
         if not re.fullmatch(r"e[0-9]+", element_id):
             raise ValueError(f"Invalid element_id: {element_id}")
-        if element_id not in {element.id for element in elements}:
+        element_by_id = {element.id: element for element in elements}
+        element = element_by_id.get(element_id)
+        if element is None:
             raise ValueError(f"Unknown element_id in current snapshot: {element_id}")
+        if not element.enabled:
+            raise ValueError(f"Target element is disabled: {element_id}")
     else:
         element_id = ""
 
@@ -744,6 +887,60 @@ def select_uia_loop_decision(
     return validate_loop_decision(payload, elements)
 
 
+def select_uia_loop_decision_with_tools(
+    request: str,
+    elements: list[UiaElement],
+    diff: UiaSnapshotDiff,
+    last_action: dict[str, Any] | None,
+    turn: int,
+    max_turns: int,
+    model: str = MODEL,
+) -> UiaLoopDecision:
+    """Ask the SLM to call exactly one fixed UI Automation loop tool."""
+    if not elements:
+        raise ValueError("No UI Automation elements were found.")
+
+    candidates = loop_candidate_elements(request, elements, diff)
+    response = chat(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You control Windows UI Automation one safe action at a time. "
+                    "Every element_id is valid only for the current snapshot. "
+                    "UI changes from the previous turn are highlighted, but choose only from Current elements. "
+                    "Call exactly one tool. Do not call multiple tools in one turn. "
+                    "Use done only when the user goal is complete or no useful safe action remains. "
+                    "Use wait only when the UI is likely still loading. "
+                    "Do not invent shell commands, Python code, selectors, coordinates, or extra steps."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Goal:\n{request}\n\n"
+                    f"Turn: {turn}/{max_turns}\n\n"
+                    "Last action:\n"
+                    f"{json.dumps(last_action or {}, ensure_ascii=False)}\n\n"
+                    "UI changes since last observation:\n"
+                    f"{format_snapshot_diff(diff)}\n\n"
+                    "Current elements, one JSON object per line:\n"
+                    f"{_element_catalog(candidates)}"
+                ),
+            },
+        ],
+        tools=build_uia_action_tools(include_loop_actions=True),
+        think=False,
+        options={"temperature": 0},
+    )
+
+    payload = _single_tool_call_payload(
+        response,
+        allowed_tools={"click", "set_text", "focus", "wait", "done"},
+    )
+    return validate_loop_decision(payload, elements)
+
 def _decision_to_plan(decision: UiaLoopDecision) -> UiaPlan:
     """Convert an executable loop decision to the existing one-shot plan type."""
     if decision.action not in {"click", "set_text", "focus"}:
@@ -806,13 +1003,63 @@ def select_uia_plan(
     return validate_uia_plan(payload, elements)
 
 
+def select_uia_plan_with_tools(
+    request: str,
+    elements: list[UiaElement],
+    model: str = MODEL,
+) -> UiaPlan:
+    """Ask the SLM to call exactly one fixed UI Automation action tool."""
+    if not elements:
+        raise ValueError("No UI Automation elements were found.")
+
+    candidates = candidate_elements_for_request(request, elements)
+    response = chat(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You choose exactly one UI Automation action for the user request. "
+                    "The user request is the highest-priority signal. "
+                    "Call exactly one tool. Do not call multiple tools in one turn. "
+                    "Choose element_id from the provided candidate list only. "
+                    "Allowed tools are click, set_text, and focus. "
+                    "Use set_text only when the user asks to enter text, and put that exact text in text. "
+                    "Do not choose an unrelated repeated/history item just because it is visible. "
+                    "Do not invent shell commands, Python code, selectors, coordinates, or extra steps."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Request:\n{request}\n\n"
+                    "Candidate elements, one JSON object per line:\n"
+                    f"{_element_catalog(candidates)}"
+                ),
+            },
+        ],
+        tools=build_uia_action_tools(include_loop_actions=False),
+        think=False,
+        options={"temperature": 0},
+    )
+
+    payload = _single_tool_call_payload(
+        response,
+        allowed_tools={"click", "set_text", "focus"},
+    )
+    return validate_uia_plan(payload, elements)
+
 def validate_uia_plan(payload: dict[str, Any], elements: list[UiaElement]) -> UiaPlan:
     """Validate an SLM UI Automation plan against the observed elements."""
     element_id = str(payload.get("element_id", ""))
     if not re.fullmatch(r"e[0-9]+", element_id):
         raise ValueError(f"Invalid element_id: {element_id}")
-    if element_id not in {element.id for element in elements}:
+    element_by_id = {element.id: element for element in elements}
+    element = element_by_id.get(element_id)
+    if element is None:
         raise ValueError(f"Unknown element_id: {element_id}")
+    if not element.enabled:
+        raise ValueError(f"Target element is disabled: {element_id}")
 
     action = str(payload.get("action", ""))
     if action not in {"click", "set_text", "focus"}:
@@ -862,10 +1109,14 @@ def run_uia_agent(
     window_title: str = "",
     foreground: bool = True,
     dry_run: bool = False,
+    use_tool_calls: bool = False,
 ) -> str:
     """Collect UI elements, ask the SLM for one action, and optionally execute it."""
     elements = list_window_elements(window_title=window_title, foreground=foreground)
-    plan = select_uia_plan(request, elements)
+    if use_tool_calls:
+        plan = select_uia_plan_with_tools(request, elements)
+    else:
+        plan = select_uia_plan(request, elements)
     selection = {
         "element_id": plan.element_id,
         "action": plan.action,
@@ -944,6 +1195,7 @@ def run_uia_agent_loop(
     foreground: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+    use_tool_calls: bool = False,
 ) -> str:
     """Run an experimental UI Automation agent loop with fresh observations each turn."""
     previous_elements: list[UiaElement] | None = None
@@ -953,14 +1205,24 @@ def run_uia_agent_loop(
 
     for turn in range(1, max_turns + 1):
         diff = diff_snapshots(previous_elements, elements)
-        decision = select_uia_loop_decision(
-            request=request,
-            elements=elements,
-            diff=diff,
-            last_action=last_action,
-            turn=turn,
-            max_turns=max_turns,
-        )
+        if use_tool_calls:
+            decision = select_uia_loop_decision_with_tools(
+                request=request,
+                elements=elements,
+                diff=diff,
+                last_action=last_action,
+                turn=turn,
+                max_turns=max_turns,
+            )
+        else:
+            decision = select_uia_loop_decision(
+                request=request,
+                elements=elements,
+                diff=diff,
+                last_action=last_action,
+                turn=turn,
+                max_turns=max_turns,
+            )
         decision_payload = _loop_decision_payload(turn, decision, elements)
         print(json.dumps(decision_payload, ensure_ascii=False, indent=2))
 
@@ -1023,6 +1285,11 @@ def main() -> None:
         action="store_true",
         help="Print observed UI Automation elements and exit without SLM or actions.",
     )
+    parser.add_argument(
+        "--tool-calls",
+        action="store_true",
+        help="Use Ollama tool calling instead of structured JSON output.",
+    )
     args = parser.parse_args()
 
     if args.list_elements:
@@ -1043,6 +1310,7 @@ def main() -> None:
             foreground=args.foreground,
             max_turns=args.max_turns,
             settle_seconds=args.settle_seconds,
+            use_tool_calls=args.tool_calls,
         )
     else:
         result = run_uia_agent(
@@ -1050,6 +1318,7 @@ def main() -> None:
             window_title=args.title,
             foreground=args.foreground,
             dry_run=args.dry_run,
+            use_tool_calls=args.tool_calls,
         )
     if result:
         print(result)
@@ -1057,9 +1326,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
