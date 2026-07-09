@@ -12,7 +12,7 @@ from local_actions.registry import actions, execute_action
 from local_actions.slm import WEEKDAY_NAMES, parameter_schema
 
 
-MODEL = "qwen3.5:0.8b"
+MODEL = "functiongemma"
 DEFAULT_MAX_TURNS = 5
 PREVIEW_LIMIT = 300
 
@@ -106,7 +106,7 @@ def run_agent_loop(
     while True:
         for turn in range(1, max_turns + 1):
             turn_start = time.perf_counter()
-            # print(f"\n--- ターン {turn}/{max_turns} ---")
+            print(f"\n--- {turn}/{max_turns} ---")
 
             response = chat(
                 model=MODEL,

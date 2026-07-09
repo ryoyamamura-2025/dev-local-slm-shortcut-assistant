@@ -11,7 +11,7 @@ from typing import Any, Literal
 from ollama import chat
 
 
-MODEL = "qwen3:1.7b"
+MODEL = "gemma3:270m"
 MAX_ELEMENTS = 120
 DEFAULT_MAX_TURNS = 5
 DEFAULT_SETTLE_SECONDS = 0.5
